@@ -350,7 +350,7 @@ pub trait NFSFileSystem: Sync {
             tfiles: 1024 * 1024 * 1024,
             ffiles: 1024 * 1024 * 1024,
             afiles: 1024 * 1024 * 1024,
-            invarsec: u32::MAX,
+            invarsec: 0,
         };
         Ok(res)
     }

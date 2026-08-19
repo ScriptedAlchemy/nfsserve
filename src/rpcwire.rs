@@ -28,6 +28,7 @@ pub(crate) async fn handle_rpc(
     input: &mut impl Read,
     output: &mut impl Write,
     mut context: RPCContext,
+    connection_incarnation: u64,
 ) -> Result<bool, anyhow::Error> {
     let mut recv = rpc_msg::default();
     recv.deserialize(input)?;
@@ -59,7 +60,8 @@ pub(crate) async fn handle_rpc(
 
         let res = {
             if call.prog == nfs::PROGRAM {
-                nfs_handlers::handle_nfs(xid, call, input, output, &context).await
+                nfs_handlers::handle_nfs(xid, call, input, output, &context, connection_incarnation)
+                    .await
             } else if call.prog == portmap::PROGRAM {
                 portmap_handlers::handle_portmap(xid, call, input, output, &context)
             } else if call.prog == mount::PROGRAM {

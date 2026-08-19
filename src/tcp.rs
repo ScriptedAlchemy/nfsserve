@@ -11,6 +11,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{io, net::IpAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -29,6 +30,8 @@ const MAX_INFLIGHT_REQUESTS: usize = 32;
 pub(crate) const MAX_RPC_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const CONNECTION_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const GLOBAL_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
+
+static NEXT_CONNECTION_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 struct TransportLimits {
@@ -170,12 +173,17 @@ async fn read_admitted_record<R: AsyncRead + Unpin>(
     }
 }
 
-async fn process_record(bytes: Vec<u8>, context: RPCContext) -> anyhow::Result<Option<Vec<u8>>> {
+async fn process_record(
+    bytes: Vec<u8>,
+    context: RPCContext,
+    connection_incarnation: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
     let should_reply = handle_rpc(
         &mut Cursor::new(bytes),
         &mut Cursor::new(&mut output),
         context,
+        connection_incarnation,
     )
     .await?;
     Ok(should_reply.then_some(output))
@@ -197,6 +205,8 @@ where
     assert!(limits.max_record_bytes > 0);
     assert!(limits.connection_inflight_bytes >= limits.max_record_bytes);
     let connection_budget = Arc::new(Semaphore::new(limits.connection_inflight_bytes));
+    let connection_incarnation =
+        NEXT_CONNECTION_INCARNATION.fetch_add(1, Ordering::Relaxed);
     let command_connection_budget = Arc::clone(&connection_budget);
     let command_global_budget = Arc::clone(&global_budget);
     // Keep read and write progress independently pollable. With one coupled
@@ -299,7 +309,12 @@ where
                     Some(Ok(record)) => {
                         let record_context = context.clone();
                         inflight.push(Box::pin(async move {
-                            let result = process_record(record.bytes, record_context).await;
+                            let result = process_record(
+                                record.bytes,
+                                record_context,
+                                connection_incarnation,
+                            )
+                            .await;
                             (result, record.credit)
                         }));
                     }

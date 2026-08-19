@@ -2,9 +2,12 @@
 #![allow(dead_code)]
 use crate::context::RPCContext;
 use crate::nfs;
+use crate::nfs::stable_how;
 use crate::rpc::*;
 use crate::tcp::MAX_RPC_RECORD_BYTES;
-use crate::vfs::{AuthContext, VFSCapabilities};
+use crate::vfs::{
+    AuthContext, CommitRequestContext, RpcRequestContext, VFSCapabilities, WriteRequestContext,
+};
 use crate::xdr::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
@@ -131,6 +134,7 @@ pub async fn handle_nfs(
     input: &mut impl Read,
     output: &mut impl Write,
     context: &RPCContext,
+    connection_incarnation: u64,
 ) -> Result<(), anyhow::Error> {
     if call.vers != nfs::VERSION {
         warn!(
@@ -156,7 +160,9 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_READDIRPLUS => {
             nfsproc3_readdirplus(xid, input, output, context).await?
         }
-        NFSProgram::NFSPROC3_WRITE => nfsproc3_write(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_WRITE => {
+            nfsproc3_write(xid, input, output, context, connection_incarnation).await?
+        }
         NFSProgram::NFSPROC3_CREATE => nfsproc3_create(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_SETATTR => nfsproc3_setattr(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context).await?,
@@ -167,7 +173,9 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_READLINK => nfsproc3_readlink(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_MKNOD => nfsproc3_mknod(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_LINK => nfsproc3_link(xid, input, output, context).await?,
-        NFSProgram::NFSPROC3_COMMIT => nfsproc3_commit(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_COMMIT => {
+            nfsproc3_commit(xid, input, output, context, connection_incarnation).await?
+        }
         _ => {
             warn!("Unimplemented message {:?}", prog);
             proc_unavail_reply_message(xid).serialize(output)?;
@@ -1180,17 +1188,6 @@ pub async fn nfsproc3_readdir(
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
-#[repr(u32)]
-pub enum stable_how {
-    #[default]
-    UNSTABLE = 0,
-    DATA_SYNC = 1,
-    FILE_SYNC = 2,
-}
-XDREnumSerde!(stable_how);
-
-#[allow(non_camel_case_types)]
 #[derive(Debug, Default)]
 struct WRITE3args {
     file: nfs::nfs_fh3,
@@ -1252,6 +1249,7 @@ pub async fn nfsproc3_write(
     input: &mut impl Read,
     output: &mut impl Write,
     context: &RPCContext,
+    connection_incarnation: u64,
 ) -> Result<(), anyhow::Error> {
     // if we do not have write capabilities
     if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
@@ -1276,6 +1274,14 @@ pub async fn nfsproc3_write(
         garbage_args_reply_message(xid).serialize(output)?;
         return Ok(());
     }
+    // sanity check the requested stability level
+    let requested_stability = match stable_how::from_u32(args.stable) {
+        Some(stability) => stability,
+        None => {
+            garbage_args_reply_message(xid).serialize(output)?;
+            return Ok(());
+        }
+    };
 
     let id = context.vfs.fh_to_id(&args.file);
     if let Err(stat) = id {
@@ -1299,21 +1305,36 @@ pub async fn nfsproc3_write(
         Err(_) => nfs::pre_op_attr::Void,
     };
 
+    let write_context = WriteRequestContext {
+        rpc: RpcRequestContext {
+            xid,
+            client_addr: context.client_addr.clone(),
+            connection_incarnation,
+        },
+        requested_stability,
+    };
+
     match context
         .vfs
-        .write(&auth_from_context(context), id, args.offset, &args.data)
+        .write_with_context(
+            &write_context,
+            &auth_from_context(context),
+            id,
+            args.offset,
+            &args.data,
+        )
         .await
     {
-        Ok(fattr) => {
-            debug!("write success {:?} --> {:?}", xid, fattr);
+        Ok(result) => {
+            debug!("write success {:?} --> {:?}", xid, result.attributes);
             let res = WRITE3resok {
                 file_wcc: nfs::wcc_data {
                     before: pre_obj_attr,
-                    after: nfs::post_op_attr::attributes(fattr),
+                    after: nfs::post_op_attr::attributes(result.attributes),
                 },
                 count: args.count,
-                committed: stable_how::FILE_SYNC,
-                verf: context.vfs.serverid(),
+                committed: result.committed,
+                verf: result.verifier,
             };
             make_success_reply(xid).serialize(output)?;
             nfs::nfsstat3::NFS3_OK.serialize(output)?;
@@ -1386,6 +1407,7 @@ pub async fn nfsproc3_commit(
     input: &mut impl Read,
     output: &mut impl Write,
     context: &RPCContext,
+    connection_incarnation: u64,
 ) -> Result<(), anyhow::Error> {
     debug!("Handling COMMIT request: xid = {:?}", xid);
 
@@ -1421,12 +1443,26 @@ pub async fn nfsproc3_commit(
         Err(_) => nfs::pre_op_attr::Void,
     };
 
+    let commit_context = CommitRequestContext {
+        rpc: RpcRequestContext {
+            xid,
+            client_addr: context.client_addr.clone(),
+            connection_incarnation,
+        },
+    };
+
     match context
         .vfs
-        .commit(&auth_from_context(context), id, args.offset, args.count)
+        .commit_with_context(
+            &commit_context,
+            &auth_from_context(context),
+            id,
+            args.offset,
+            args.count,
+        )
         .await
     {
-        Ok(verf) => {
+        Ok(result) => {
             debug!("commit success {:?}", xid);
 
             // Get post-operation attributes
@@ -1440,7 +1476,10 @@ pub async fn nfsproc3_commit(
                 after: post_obj_attr,
             };
 
-            let res = COMMIT3resok { file_wcc, verf };
+            let res = COMMIT3resok {
+                file_wcc,
+                verf: result.verifier,
+            };
 
             make_success_reply(xid).serialize(output)?;
             nfs::nfsstat3::NFS3_OK.serialize(output)?;
@@ -2702,4 +2741,209 @@ pub async fn nfsproc3_link<W: Write>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transaction_tracker::TransactionTracker;
+    use crate::vfs::test_support::ContextRecordingFs;
+    use crate::vfs::NFSFileSystem;
+    use std::io::Cursor;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_context(fs: Arc<ContextRecordingFs>) -> RPCContext {
+        RPCContext {
+            local_port: 2049,
+            client_addr: "127.0.0.1:51000".to_string(),
+            auth: auth_unix {
+                stamp: 0,
+                machinename: b"testhost".to_vec(),
+                uid: 1000,
+                gid: 100,
+                gids: vec![100, 20],
+            },
+            vfs: fs,
+            mount_signal: None,
+            export_name: Arc::new("/".to_string()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_forwards_context_and_result_reaches_the_wire() {
+        let verifier: nfs::writeverf3 = [9, 8, 7, 6, 5, 4, 3, 2];
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::UNSTABLE, verifier));
+        let context = test_context(fs.clone());
+        let xid = 0xabcd;
+        let incarnation = 77;
+        let fileid: nfs::fileid3 = 42;
+        let data = b"some bytes".to_vec();
+
+        let args = WRITE3args {
+            file: fs.id_to_fh(fileid),
+            offset: 4096,
+            count: data.len() as u32,
+            stable: stable_how::DATA_SYNC as u32,
+            data: data.clone(),
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_write(
+            xid,
+            &mut Cursor::new(request),
+            &mut output,
+            &context,
+            incarnation,
+        )
+        .await
+        .unwrap();
+
+        {
+            let writes = fs.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            let captured = &writes[0];
+            assert_eq!(captured.xid, xid);
+            assert_eq!(captured.client_addr, context.client_addr);
+            assert_eq!(captured.connection_incarnation, incarnation);
+            assert_eq!(captured.requested_stability, stable_how::DATA_SYNC);
+            assert_eq!(captured.auth.uid, 1000);
+            assert_eq!(captured.auth.gid, 100);
+            assert_eq!(captured.auth.gids, vec![100, 20]);
+            assert_eq!(captured.id, fileid);
+            assert_eq!(captured.offset, 4096);
+            assert_eq!(captured.data, data);
+        }
+        // the handler must not also invoke the legacy path
+        assert_eq!(fs.legacy_write_calls.load(Ordering::SeqCst), 0);
+
+        // the returned committed level and verifier must reach the wire
+        let pre = ContextRecordingFs::attr(fileid, 512);
+        let mut expected = Vec::new();
+        make_success_reply(xid).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3_OK.serialize(&mut expected).unwrap();
+        WRITE3resok {
+            file_wcc: nfs::wcc_data {
+                before: nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                    size: pre.size,
+                    mtime: pre.mtime,
+                    ctime: pre.ctime,
+                }),
+                after: nfs::post_op_attr::attributes(ContextRecordingFs::attr(
+                    fileid,
+                    4096 + data.len() as u64,
+                )),
+            },
+            count: data.len() as u32,
+            committed: stable_how::UNSTABLE,
+            verf: verifier,
+        }
+        .serialize(&mut expected)
+        .unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn write_with_invalid_stable_how_returns_garbage_args() {
+        let fs = Arc::new(ContextRecordingFs::new(
+            stable_how::FILE_SYNC,
+            [0u8; nfs::NFS3_WRITEVERFSIZE as usize],
+        ));
+        let context = test_context(fs.clone());
+        let xid = 99;
+        let data = b"abc".to_vec();
+
+        let args = WRITE3args {
+            file: fs.id_to_fh(7),
+            offset: 0,
+            count: data.len() as u32,
+            stable: 3, // not a valid stable_how value
+            data,
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_write(xid, &mut Cursor::new(request), &mut output, &context, 1)
+            .await
+            .unwrap();
+
+        assert!(fs.writes.lock().unwrap().is_empty());
+        assert_eq!(fs.legacy_write_calls.load(Ordering::SeqCst), 0);
+
+        let mut expected = Vec::new();
+        garbage_args_reply_message(xid)
+            .serialize(&mut expected)
+            .unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn commit_forwards_context_and_verifier_reaches_the_wire() {
+        let verifier: nfs::writeverf3 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, verifier));
+        let context = test_context(fs.clone());
+        let xid = 0x1234;
+        let incarnation = 5;
+        let fileid: nfs::fileid3 = 8;
+
+        let args = COMMIT3args {
+            file: fs.id_to_fh(fileid),
+            offset: 100,
+            count: 200,
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_commit(
+            xid,
+            &mut Cursor::new(request),
+            &mut output,
+            &context,
+            incarnation,
+        )
+        .await
+        .unwrap();
+
+        {
+            let commits = fs.commits.lock().unwrap();
+            assert_eq!(commits.len(), 1);
+            let captured = &commits[0];
+            assert_eq!(captured.xid, xid);
+            assert_eq!(captured.client_addr, context.client_addr);
+            assert_eq!(captured.connection_incarnation, incarnation);
+            assert_eq!(captured.auth.uid, 1000);
+            assert_eq!(captured.auth.gid, 100);
+            assert_eq!(captured.auth.gids, vec![100, 20]);
+            assert_eq!(captured.fileid, fileid);
+            assert_eq!(captured.offset, 100);
+            assert_eq!(captured.count, 200);
+        }
+        // the handler must not also invoke the legacy path
+        assert_eq!(fs.legacy_commit_calls.load(Ordering::SeqCst), 0);
+
+        let attr = ContextRecordingFs::attr(fileid, 512);
+        let mut expected = Vec::new();
+        make_success_reply(xid).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3_OK.serialize(&mut expected).unwrap();
+        COMMIT3resok {
+            file_wcc: nfs::wcc_data {
+                before: nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                    size: attr.size,
+                    mtime: attr.mtime,
+                    ctime: attr.ctime,
+                }),
+                after: nfs::post_op_attr::attributes(attr),
+            },
+            verf: verifier,
+        }
+        .serialize(&mut expected)
+        .unwrap();
+        assert_eq!(output, expected);
+    }
 }

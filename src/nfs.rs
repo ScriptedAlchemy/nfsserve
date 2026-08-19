@@ -219,6 +219,19 @@ pub enum ftype3 {
     NF3FIFO = 7,
 }
 XDREnumSerde!(ftype3);
+
+/// Write stability level requested by the client / honored by the server
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum stable_how {
+    #[default]
+    UNSTABLE = 0,
+    DATA_SYNC = 1,
+    FILE_SYNC = 2,
+}
+XDREnumSerde!(stable_how);
+
 /// Device Number information. Ex: Major / Minor device
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]

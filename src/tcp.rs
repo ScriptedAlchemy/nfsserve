@@ -1867,6 +1867,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_retransmissions_reach_the_contextual_vfs() {
+        const RECORD_LIMIT: usize = 1024;
+        let fs = Arc::new(BlockingWriteFs::new());
+        fs.release.add_permits(2);
+        let context = test_context(Arc::clone(&fs));
+        let limits = TransportLimits {
+            max_inflight_requests: 2,
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            context,
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        for _ in 0..2 {
+            send_record(&mut client_writer, &write_call(17, 16)).await;
+        }
+        client_writer.shutdown().await.unwrap();
+
+        let mut replies = 0;
+        while read_record(&mut client_reader).await.is_ok() {
+            replies += 1;
+        }
+        server.await.unwrap().unwrap();
+
+        assert_eq!(replies, 2);
+        assert_eq!(fs.started.load(Ordering::SeqCst), 2);
+        assert_eq!(global_budget.available_permits(), 2 * RECORD_LIMIT);
+    }
+
+    #[tokio::test]
     async fn oversized_read_is_rejected_before_entering_the_filesystem() {
         const RECORD_LIMIT: usize = 2 * 1024 * 1024;
         let fs = Arc::new(BlockingWriteFs::new());

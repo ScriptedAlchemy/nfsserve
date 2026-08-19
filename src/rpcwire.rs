@@ -22,6 +22,7 @@ use crate::portmap_handlers;
 const NFS_ACL_PROGRAM: u32 = 100227;
 const NFS_ID_MAP_PROGRAM: u32 = 100270;
 const NFS_METADATA_PROGRAM: u32 = 200024;
+const NFS_WRITE_PROCEDURE: u32 = 7;
 
 pub(crate) async fn handle_rpc(
     input: &mut impl Read,
@@ -44,9 +45,20 @@ pub(crate) async fn handle_rpc(
             return Ok(true);
         }
 
-        if context
-            .transaction_tracker
-            .is_retransmission(xid, &context.client_addr)
+        // Contextual NFS WRITE implementations own replay and collision
+        // semantics using connection incarnation + XID + fingerprint. Do not
+        // suppress those calls before the VFS sees them. Positioned NFSv3
+        // WRITE remains idempotent for legacy implementations using the
+        // additive default method.
+        let tracked_by_rpc = !(call.prog == nfs::PROGRAM
+            && call.vers == nfs::VERSION
+            && call.proc == NFS_WRITE_PROCEDURE);
+        if tracked_by_rpc
+            && context.transaction_tracker.is_retransmission(
+                connection_incarnation,
+                xid,
+                &context.client_addr,
+            )
         {
             // This is a retransmission
             // Drop the message and return
@@ -83,9 +95,13 @@ pub(crate) async fn handle_rpc(
             }
         }
         .map(|_| true);
-        context
-            .transaction_tracker
-            .mark_processed(xid, &context.client_addr);
+        if tracked_by_rpc {
+            context.transaction_tracker.mark_processed(
+                connection_incarnation,
+                xid,
+                &context.client_addr,
+            );
+        }
         res
     } else {
         error!("Unexpectedly received a Reply instead of a Call");

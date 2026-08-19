@@ -80,6 +80,53 @@ pub enum VFSCapabilities {
     ReadWrite,
 }
 
+/// Transport-level metadata describing the RPC request being served
+#[derive(Clone, Debug)]
+pub struct RpcRequestContext {
+    /// RPC transaction id of the request
+    pub xid: u32,
+    /// Address of the client that sent the request
+    pub client_addr: String,
+    /// Server-minted identifier that is unique per accepted transport
+    /// connection. A client reconnecting from the same address observes
+    /// a fresh incarnation.
+    pub connection_incarnation: u64,
+}
+
+/// Request metadata passed to [`NFSFileSystem::write_with_context`]
+#[derive(Clone, Debug)]
+pub struct WriteRequestContext {
+    /// Transport-level request metadata
+    pub rpc: RpcRequestContext,
+    /// Stability level the client requested for this write
+    pub requested_stability: stable_how,
+}
+
+/// Result of a contextual write, echoed back on the wire
+#[derive(Clone, Debug)]
+pub struct WriteResult {
+    /// Post-write attributes of the file
+    pub attributes: fattr3,
+    /// Stability level the server actually honored
+    pub committed: stable_how,
+    /// Write verifier the client uses to detect server restarts
+    pub verifier: writeverf3,
+}
+
+/// Request metadata passed to [`NFSFileSystem::commit_with_context`]
+#[derive(Clone, Debug)]
+pub struct CommitRequestContext {
+    /// Transport-level request metadata
+    pub rpc: RpcRequestContext,
+}
+
+/// Result of a contextual commit, echoed back on the wire
+#[derive(Clone, Debug)]
+pub struct CommitResult {
+    /// Write verifier the client uses to detect server restarts
+    pub verifier: writeverf3,
+}
+
 /// The basic API to implement to provide an NFS file system
 ///
 /// Opaque FH
@@ -165,6 +212,28 @@ pub trait NFSFileSystem: Sync {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3>;
+
+    /// Writes the contents of a file, with access to the request context.
+    /// The default implementation delegates to [`NFSFileSystem::write`]
+    /// and reports the write as FILE_SYNC, matching the legacy behavior.
+    /// Implementations that support unstable writes should override this
+    /// to honor `context.requested_stability`.
+    async fn write_with_context(
+        &self,
+        context: &WriteRequestContext,
+        auth: &AuthContext,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<WriteResult, nfsstat3> {
+        let _ = context;
+        let attributes = self.write(auth, id, offset, data).await?;
+        Ok(WriteResult {
+            attributes,
+            committed: stable_how::FILE_SYNC,
+            verifier: self.get_write_verf(),
+        })
+    }
 
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
@@ -302,6 +371,23 @@ pub trait NFSFileSystem: Sync {
         Ok(self.get_write_verf())
     }
 
+    /// Commit pending writes to stable storage, with access to the request
+    /// context. The default implementation delegates to
+    /// [`NFSFileSystem::commit`].
+    async fn commit_with_context(
+        &self,
+        context: &CommitRequestContext,
+        auth: &AuthContext,
+        fileid: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<CommitResult, nfsstat3> {
+        let _ = context;
+        Ok(CommitResult {
+            verifier: self.commit(auth, fileid, offset, count).await?,
+        })
+    }
+
     /// Get the current write verifier for this filesystem
     fn get_write_verf(&self) -> writeverf3 {
         // Default implementation returns a static verifier
@@ -392,5 +478,829 @@ pub trait NFSFileSystem: Sync {
 
     fn serverid(&self) -> cookieverf3 {
         GENERATION_NUMBER.to_le_bytes()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct CapturedWrite {
+        pub(crate) xid: u32,
+        pub(crate) client_addr: String,
+        pub(crate) connection_incarnation: u64,
+        pub(crate) requested_stability: stable_how,
+        pub(crate) auth: AuthContext,
+        pub(crate) id: fileid3,
+        pub(crate) offset: u64,
+        pub(crate) data: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct CapturedCommit {
+        pub(crate) xid: u32,
+        pub(crate) client_addr: String,
+        pub(crate) connection_incarnation: u64,
+        pub(crate) auth: AuthContext,
+        pub(crate) fileid: fileid3,
+        pub(crate) offset: u64,
+        pub(crate) count: u32,
+    }
+
+    /// Test filesystem that records contextual write/commit calls and
+    /// returns a configurable committed level and verifier.
+    pub(crate) struct ContextRecordingFs {
+        pub(crate) committed: stable_how,
+        pub(crate) verifier: writeverf3,
+        pub(crate) writes: Arc<Mutex<Vec<CapturedWrite>>>,
+        pub(crate) commits: Arc<Mutex<Vec<CapturedCommit>>>,
+        pub(crate) legacy_write_calls: Arc<AtomicUsize>,
+        pub(crate) legacy_commit_calls: Arc<AtomicUsize>,
+    }
+
+    impl ContextRecordingFs {
+        pub(crate) fn new(committed: stable_how, verifier: writeverf3) -> ContextRecordingFs {
+            ContextRecordingFs {
+                committed,
+                verifier,
+                writes: Arc::new(Mutex::new(Vec::new())),
+                commits: Arc::new(Mutex::new(Vec::new())),
+                legacy_write_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_commit_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        pub(crate) fn attr(id: fileid3, size: u64) -> fattr3 {
+            fattr3 {
+                fileid: id,
+                size,
+                mtime: nfs::nfstime3 {
+                    seconds: 90,
+                    nseconds: 100,
+                },
+                ctime: nfs::nfstime3 {
+                    seconds: 90,
+                    nseconds: 101,
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NFSFileSystem for ContextRecordingFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            VFSCapabilities::ReadWrite
+        }
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        async fn lookup(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
+            Ok(Self::attr(id, 512))
+        }
+        async fn setattr(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _setattr: sattr3,
+        ) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn read(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _data: &[u8],
+        ) -> Result<fattr3, nfsstat3> {
+            self.legacy_write_calls.fetch_add(1, Ordering::SeqCst);
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write_with_context(
+            &self,
+            context: &WriteRequestContext,
+            auth: &AuthContext,
+            id: fileid3,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<WriteResult, nfsstat3> {
+            self.writes.lock().unwrap().push(CapturedWrite {
+                xid: context.rpc.xid,
+                client_addr: context.rpc.client_addr.clone(),
+                connection_incarnation: context.rpc.connection_incarnation,
+                requested_stability: context.requested_stability,
+                auth: auth.clone(),
+                id,
+                offset,
+                data: data.to_vec(),
+            });
+            Ok(WriteResult {
+                attributes: Self::attr(id, offset + data.len() as u64),
+                committed: self.committed,
+                verifier: self.verifier,
+            })
+        }
+        async fn create(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _attr: sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create_exclusive(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mkdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _dirname: &filename3,
+            _attrs: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn remove(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn rename(
+            &self,
+            _auth: &AuthContext,
+            _from_dirid: fileid3,
+            _from_filename: &filename3,
+            _to_dirid: fileid3,
+            _to_filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _start_after: fileid3,
+            _max_entries: usize,
+        ) -> Result<ReadDirResult, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn symlink(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _linkname: &filename3,
+            _symlink: &nfspath3,
+            _attr: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readlink(&self, _auth: &AuthContext, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mknod(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _ftype: ftype3,
+            _attr: &sattr3,
+            _spec: Option<&specdata3>,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn link(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _linkdirid: fileid3,
+            _linkname: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn commit(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<writeverf3, nfsstat3> {
+            self.legacy_commit_calls.fetch_add(1, Ordering::SeqCst);
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn commit_with_context(
+            &self,
+            context: &CommitRequestContext,
+            auth: &AuthContext,
+            fileid: fileid3,
+            offset: u64,
+            count: u32,
+        ) -> Result<CommitResult, nfsstat3> {
+            self.commits.lock().unwrap().push(CapturedCommit {
+                xid: context.rpc.xid,
+                client_addr: context.rpc.client_addr.clone(),
+                connection_incarnation: context.rpc.connection_incarnation,
+                auth: auth.clone(),
+                fileid,
+                offset,
+                count,
+            });
+            Ok(CommitResult {
+                verifier: self.verifier,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::marker::PhantomData;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn rpc_context() -> RpcRequestContext {
+        RpcRequestContext {
+            xid: 7,
+            client_addr: "127.0.0.1:1048".to_string(),
+            connection_incarnation: 42,
+        }
+    }
+
+    fn auth() -> AuthContext {
+        AuthContext {
+            uid: 1000,
+            gid: 100,
+            gids: vec![100, 20],
+        }
+    }
+
+    /// Legacy implementor that overrides write/commit/get_write_verf and
+    /// counts how often each legacy method is called.
+    struct RecordingFs {
+        write_calls: AtomicUsize,
+        commit_calls: AtomicUsize,
+    }
+
+    impl RecordingFs {
+        fn new() -> RecordingFs {
+            RecordingFs {
+                write_calls: AtomicUsize::new(0),
+                commit_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NFSFileSystem for RecordingFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            VFSCapabilities::ReadWrite
+        }
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        async fn lookup(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn getattr(&self, _auth: &AuthContext, _id: fileid3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn setattr(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _setattr: sattr3,
+        ) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn read(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write(
+            &self,
+            _auth: &AuthContext,
+            id: fileid3,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<fattr3, nfsstat3> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fattr3 {
+                fileid: id,
+                size: offset + data.len() as u64,
+                ..Default::default()
+            })
+        }
+        async fn create(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _attr: sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create_exclusive(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mkdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _dirname: &filename3,
+            _attrs: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn remove(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn rename(
+            &self,
+            _auth: &AuthContext,
+            _from_dirid: fileid3,
+            _from_filename: &filename3,
+            _to_dirid: fileid3,
+            _to_filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _start_after: fileid3,
+            _max_entries: usize,
+        ) -> Result<ReadDirResult, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn symlink(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _linkname: &filename3,
+            _symlink: &nfspath3,
+            _attr: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readlink(&self, _auth: &AuthContext, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mknod(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _ftype: ftype3,
+            _attr: &sattr3,
+            _spec: Option<&specdata3>,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn link(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _linkdirid: fileid3,
+            _linkname: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn commit(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<writeverf3, nfsstat3> {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok([7u8; NFS3_WRITEVERFSIZE as usize])
+        }
+        fn get_write_verf(&self) -> writeverf3 {
+            [7u8; NFS3_WRITEVERFSIZE as usize]
+        }
+    }
+
+    /// Legacy implementor that omits commit and get_write_verf entirely.
+    struct LegacyFs;
+
+    #[async_trait]
+    impl NFSFileSystem for LegacyFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            VFSCapabilities::ReadWrite
+        }
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        async fn lookup(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn getattr(&self, _auth: &AuthContext, _id: fileid3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn setattr(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _setattr: sattr3,
+        ) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn read(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _data: &[u8],
+        ) -> Result<fattr3, nfsstat3> {
+            Ok(fattr3::default())
+        }
+        async fn create(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _attr: sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create_exclusive(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mkdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _dirname: &filename3,
+            _attrs: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn remove(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn rename(
+            &self,
+            _auth: &AuthContext,
+            _from_dirid: fileid3,
+            _from_filename: &filename3,
+            _to_dirid: fileid3,
+            _to_filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _start_after: fileid3,
+            _max_entries: usize,
+        ) -> Result<ReadDirResult, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn symlink(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _linkname: &filename3,
+            _symlink: &nfspath3,
+            _attr: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readlink(&self, _auth: &AuthContext, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mknod(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _ftype: ftype3,
+            _attr: &sattr3,
+            _spec: Option<&specdata3>,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn link(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _linkdirid: fileid3,
+            _linkname: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+    }
+
+    /// Marker that keeps a type `Sync` while making it `!Send`.
+    struct NotSendMarker(PhantomData<*const ()>);
+    unsafe impl Sync for NotSendMarker {}
+
+    /// A `Sync` but not `Send` legacy implementor. The `NFSFileSystem`
+    /// trait bound is exactly `Sync`, so this must keep compiling.
+    struct SyncNotSendFs {
+        _marker: NotSendMarker,
+        write_calls: AtomicUsize,
+    }
+
+    impl SyncNotSendFs {
+        fn new() -> SyncNotSendFs {
+            SyncNotSendFs {
+                _marker: NotSendMarker(PhantomData),
+                write_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NFSFileSystem for SyncNotSendFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            VFSCapabilities::ReadWrite
+        }
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        async fn lookup(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn getattr(&self, _auth: &AuthContext, _id: fileid3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn setattr(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _setattr: sattr3,
+        ) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn read(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write(
+            &self,
+            _auth: &AuthContext,
+            _id: fileid3,
+            _offset: u64,
+            _data: &[u8],
+        ) -> Result<fattr3, nfsstat3> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fattr3::default())
+        }
+        async fn create(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _attr: sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create_exclusive(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mkdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _dirname: &filename3,
+            _attrs: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn remove(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn rename(
+            &self,
+            _auth: &AuthContext,
+            _from_dirid: fileid3,
+            _from_filename: &filename3,
+            _to_dirid: fileid3,
+            _to_filename: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readdir(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _start_after: fileid3,
+            _max_entries: usize,
+        ) -> Result<ReadDirResult, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn symlink(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _linkname: &filename3,
+            _symlink: &nfspath3,
+            _attr: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readlink(&self, _auth: &AuthContext, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mknod(
+            &self,
+            _auth: &AuthContext,
+            _dirid: fileid3,
+            _filename: &filename3,
+            _ftype: ftype3,
+            _attr: &sattr3,
+            _spec: Option<&specdata3>,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn link(
+            &self,
+            _auth: &AuthContext,
+            _fileid: fileid3,
+            _linkdirid: fileid3,
+            _linkname: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+    }
+
+    #[tokio::test]
+    async fn write_with_context_delegates_to_write_exactly_once() {
+        let fs = RecordingFs::new();
+        let context = WriteRequestContext {
+            rpc: rpc_context(),
+            requested_stability: stable_how::UNSTABLE,
+        };
+        let result = fs
+            .write_with_context(&context, &auth(), 3, 10, b"hello")
+            .await
+            .unwrap();
+        assert_eq!(fs.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs.commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.committed, stable_how::FILE_SYNC);
+        assert_eq!(result.verifier, [7u8; NFS3_WRITEVERFSIZE as usize]);
+        assert_eq!(result.attributes.size, 15);
+    }
+
+    #[tokio::test]
+    async fn commit_with_context_delegates_to_commit_exactly_once() {
+        let fs = RecordingFs::new();
+        let context = CommitRequestContext { rpc: rpc_context() };
+        let result = fs
+            .commit_with_context(&context, &auth(), 3, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(fs.commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.verifier, [7u8; NFS3_WRITEVERFSIZE as usize]);
+    }
+
+    #[tokio::test]
+    async fn legacy_implementor_without_commit_gets_defaults() {
+        let fs = LegacyFs;
+        let zero = [0u8; NFS3_WRITEVERFSIZE as usize];
+        assert_eq!(fs.get_write_verf(), zero);
+        assert_eq!(fs.commit(&auth(), 1, 0, 0).await.unwrap(), zero);
+        let write = fs
+            .write_with_context(
+                &WriteRequestContext {
+                    rpc: rpc_context(),
+                    requested_stability: stable_how::DATA_SYNC,
+                },
+                &auth(),
+                1,
+                0,
+                b"x",
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.committed, stable_how::FILE_SYNC);
+        assert_eq!(write.verifier, zero);
+        let commit = fs
+            .commit_with_context(
+                &CommitRequestContext { rpc: rpc_context() },
+                &auth(),
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit.verifier, zero);
+    }
+
+    #[test]
+    fn sync_but_not_send_implementor_compiles() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<SyncNotSendFs>();
+
+        let fs = SyncNotSendFs::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let context = WriteRequestContext {
+            rpc: rpc_context(),
+            requested_stability: stable_how::UNSTABLE,
+        };
+        let result = runtime
+            .block_on(fs.write_with_context(&context, &auth(), 1, 0, b"hi"))
+            .unwrap();
+        assert_eq!(fs.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.committed, stable_how::FILE_SYNC);
     }
 }

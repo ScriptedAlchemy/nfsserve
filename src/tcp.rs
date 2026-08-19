@@ -936,6 +936,18 @@ mod tests {
         call
     }
 
+    fn commit_call(xid: u32) -> Vec<u8> {
+        let mut call = Vec::with_capacity(76);
+        for value in [xid, 0, 2, 100003, 3, 21, 0, 0, 0, 0, 16] {
+            call.extend_from_slice(&value.to_be_bytes());
+        }
+        call.extend_from_slice(&0u64.to_le_bytes());
+        call.extend_from_slice(&1u64.to_le_bytes());
+        call.extend_from_slice(&0u64.to_be_bytes());
+        call.extend_from_slice(&0u32.to_be_bytes());
+        call
+    }
+
     fn null_call(xid: u32) -> Vec<u8> {
         let mut call = Vec::with_capacity(40);
         for value in [xid, 0, 2, 100003, 3, 0, 0, 0, 0, 0] {
@@ -1904,6 +1916,54 @@ mod tests {
 
         assert_eq!(replies, 2);
         assert_eq!(fs.started.load(Ordering::SeqCst), 2);
+        assert_eq!(global_budget.available_permits(), 2 * RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn commit_retransmissions_reach_the_contextual_vfs() {
+        const RECORD_LIMIT: usize = 1024;
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, [3; 8]));
+        let context = RPCContext {
+            local_port: 2049,
+            client_addr: "127.0.0.1:12345".to_string(),
+            auth: crate::rpc::auth_unix::default(),
+            vfs: fs.clone(),
+            mount_signal: None,
+            export_name: Arc::new("/".to_string()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+        };
+        let limits = TransportLimits {
+            max_inflight_requests: 2,
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            context,
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        for _ in 0..2 {
+            send_record(&mut client_writer, &commit_call(18)).await;
+        }
+        client_writer.shutdown().await.unwrap();
+
+        let mut replies = 0;
+        while read_record(&mut client_reader).await.is_ok() {
+            replies += 1;
+        }
+        server.await.unwrap().unwrap();
+
+        assert_eq!(replies, 2);
+        assert_eq!(fs.commits.lock().unwrap().len(), 2);
         assert_eq!(global_budget.available_permits(), 2 * RECORD_LIMIT);
     }
 

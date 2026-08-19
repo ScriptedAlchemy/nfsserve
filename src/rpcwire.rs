@@ -23,6 +23,7 @@ const NFS_ACL_PROGRAM: u32 = 100227;
 const NFS_ID_MAP_PROGRAM: u32 = 100270;
 const NFS_METADATA_PROGRAM: u32 = 200024;
 const NFS_WRITE_PROCEDURE: u32 = 7;
+const NFS_COMMIT_PROCEDURE: u32 = 21;
 
 pub(crate) async fn handle_rpc(
     input: &mut impl Read,
@@ -46,13 +47,14 @@ pub(crate) async fn handle_rpc(
         }
 
         // Contextual NFS WRITE implementations own replay and collision
-        // semantics using connection incarnation + XID + fingerprint. Do not
-        // suppress those calls before the VFS sees them. Positioned NFSv3
+        // semantics using connection incarnation + XID + fingerprint. COMMIT
+        // is idempotent and must also produce a reply for every retransmission.
+        // Do not suppress either call before the VFS sees it. Positioned NFSv3
         // WRITE remains idempotent for legacy implementations using the
         // additive default method.
         let tracked_by_rpc = !(call.prog == nfs::PROGRAM
             && call.vers == nfs::VERSION
-            && call.proc == NFS_WRITE_PROCEDURE);
+            && matches!(call.proc, NFS_WRITE_PROCEDURE | NFS_COMMIT_PROCEDURE));
         if tracked_by_rpc
             && context.transaction_tracker.is_retransmission(
                 connection_incarnation,

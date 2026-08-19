@@ -45,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 intaglio = { version = "1.6", optional = true }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["time"], default-features = false }
+
 [features]
 strict = []
 demo = ["tracing-subscriber", "tokio/rt-multi-thread", "intaglio"]

@@ -4,8 +4,9 @@ use std::io::{Read, Write};
 pub type XDREndian = BigEndian;
 use crate::nfs::nfsstring;
 
-/// See https://datatracker.ietf.org/doc/html/rfc1014
+const MAX_OPAQUE_BYTES: usize = 2 * 1024 * 1024;
 
+/// See https://datatracker.ietf.org/doc/html/rfc1014
 #[allow(clippy::upper_case_acronyms)]
 pub trait XDR {
     fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()>;
@@ -121,6 +122,18 @@ impl XDR for Vec<u8> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        if length as usize > MAX_OPAQUE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("XDR opaque length {length} exceeds limit {MAX_OPAQUE_BYTES}"),
+            ));
+        }
+        self.try_reserve_exact(length as usize).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("unable to reserve XDR opaque body: {error}"),
+            )
+        })?;
         self.resize(length as usize, 0);
         src.read_exact(self)?;
         // read padding
@@ -153,6 +166,26 @@ impl XDR for Vec<u32> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        let bytes = (length as usize)
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "XDR vector length overflow",
+                )
+            })?;
+        if bytes > MAX_OPAQUE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("XDR vector length {bytes} exceeds limit {MAX_OPAQUE_BYTES}"),
+            ));
+        }
+        self.try_reserve_exact(length as usize).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("unable to reserve XDR vector: {error}"),
+            )
+        })?;
         self.resize(length as usize, 0);
         for i in self {
             i.deserialize(src)?;
@@ -233,3 +266,32 @@ macro_rules! XDRBoolUnion {
 pub(crate) use XDRBoolUnion;
 pub(crate) use XDREnumSerde;
 pub(crate) use XDRStruct;
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_OPAQUE_BYTES, XDR};
+    use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn oversized_opaque_length_is_rejected_before_allocation() {
+        let mut encoded = Cursor::new(((2 * 1024 * 1024 + 1) as u32).to_be_bytes());
+        let mut value = Vec::<u8>::new();
+
+        let error = value.deserialize(&mut encoded).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(value.capacity(), 0, "oversized body was allocated");
+    }
+
+    #[test]
+    fn oversized_u32_vector_is_rejected_before_allocation() {
+        let count = MAX_OPAQUE_BYTES / size_of::<u32>() + 1;
+        let mut encoded = Cursor::new((count as u32).to_be_bytes());
+        let mut value = Vec::<u32>::new();
+
+        let error = value.deserialize(&mut encoded).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(value.capacity(), 0, "oversized vector was allocated");
+    }
+}

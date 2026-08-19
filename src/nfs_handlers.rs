@@ -10,6 +10,9 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
 use std::io::{Read, Write};
 use tracing::{debug, error, trace, warn};
+
+const MAX_NFS_IO_BYTES: u32 = 1024 * 1024;
+
 /// Helper function to create AuthContext from RPCContext
 fn auth_from_context(context: &RPCContext) -> AuthContext {
     AuthContext::from_rpc_auth(&context.auth)
@@ -366,6 +369,12 @@ pub async fn nfsproc3_read(
     let mut args = READ3args::default();
     args.deserialize(input)?;
     debug!("nfsproc3_read({:?},{:?}) ", xid, args);
+    if args.count > MAX_NFS_IO_BYTES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_INVAL.serialize(output)?;
+        nfs::post_op_attr::Void.serialize(output)?;
+        return Ok(());
+    }
 
     let id = context.vfs.fh_to_id(&args.file);
     if let Err(stat) = id {
@@ -1212,6 +1221,12 @@ pub async fn nfsproc3_write(
     args.deserialize(input)?;
     debug!("nfsproc3_write({:?},...) ", xid);
     // sanity check the length
+    if args.count > MAX_NFS_IO_BYTES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_INVAL.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        return Ok(());
+    }
     if args.data.len() != args.count as usize {
         garbage_args_reply_message(xid).serialize(output)?;
         return Ok(());
@@ -2451,7 +2466,7 @@ pub async fn nfsproc3_mknod<W: Write>(
             .getattr(&auth_from_context(context), parent_id)
             .await
             .ok()
-            .map(|a| nfs::post_op_attr::attributes(a))
+            .map(nfs::post_op_attr::attributes)
             .unwrap_or(nfs::post_op_attr::Void)
     };
 
@@ -2565,7 +2580,7 @@ pub async fn nfsproc3_link<W: Write>(
         .getattr(&auth_from_context(context), file_id)
         .await
         .ok()
-        .map(|a| nfs::post_op_attr::attributes(a))
+        .map(nfs::post_op_attr::attributes)
         .unwrap_or(nfs::post_op_attr::Void);
 
     let linkdir_pre_attr = context
@@ -2589,7 +2604,7 @@ pub async fn nfsproc3_link<W: Write>(
             .getattr(&auth_from_context(context), file_id)
             .await
             .ok()
-            .map(|a| nfs::post_op_attr::attributes(a))
+            .map(nfs::post_op_attr::attributes)
             .unwrap_or(nfs::post_op_attr::Void)
     };
 
@@ -2599,7 +2614,7 @@ pub async fn nfsproc3_link<W: Write>(
             .getattr(&auth_from_context(context), link_dir_id)
             .await
             .ok()
-            .map(|a| nfs::post_op_attr::attributes(a))
+            .map(nfs::post_op_attr::attributes)
             .unwrap_or(nfs::post_op_attr::Void)
     };
 

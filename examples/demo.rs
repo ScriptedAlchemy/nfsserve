@@ -2,8 +2,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
-use nfsserve::{
+use zerofs_nfsserve::{
     nfs::{
         self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
     },
@@ -336,6 +337,7 @@ impl NFSFileSystem for DemoFS {
                     fileid: *i,
                     name: fs[(*i) as usize].name.clone(),
                     attr: fs[(*i) as usize].attr,
+                    cookie: *i,
                 });
                 if ret.entries.len() >= max_entries {
                     break;
@@ -433,10 +435,16 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), DemoFS::default())
+    let listener = NFSTcpListener::bind(
+        format!("127.0.0.1:{HOSTPORT}").parse().unwrap(),
+        DemoFS::default(),
+    )
+    .await
+    .unwrap();
+    listener
+        .handle_with_shutdown(CancellationToken::new())
         .await
         .unwrap();
-    listener.handle_forever().await.unwrap();
 }
 // Test with
 // mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/

@@ -12,12 +12,13 @@ use intaglio::osstr::SymbolTable;
 use intaglio::Symbol;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use nfsserve::fs_util::*;
-use nfsserve::nfs::*;
-use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use zerofs_nfsserve::fs_util::*;
+use zerofs_nfsserve::nfs::*;
+use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 #[derive(Debug, Clone)]
 struct FSEntry {
@@ -202,7 +203,7 @@ impl FSMap {
             self.id_to_path
                 .get_mut(&id)
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?
-                .children = Some(BTreeSet::from_iter(new_children.into_iter()));
+                .children = Some(BTreeSet::from_iter(new_children));
         }
 
         Ok(())
@@ -456,6 +457,7 @@ impl NFSFileSystem for MirrorFS {
                 fileid,
                 name: name.as_bytes().into(),
                 attr: fileent.fsmeta,
+                cookie: fileid,
             });
             if ret.entries.len() >= max_entries {
                 break;
@@ -807,10 +809,13 @@ async fn main() {
     let path = PathBuf::from(path);
 
     let fs = MirrorFS::new(path);
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), fs)
+    let listener = NFSTcpListener::bind(format!("127.0.0.1:{HOSTPORT}").parse().unwrap(), fs)
         .await
         .unwrap();
-    listener.handle_forever().await.unwrap();
+    listener
+        .handle_with_shutdown(CancellationToken::new())
+        .await
+        .unwrap();
 }
 // Test with
 // mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/

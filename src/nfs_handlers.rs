@@ -14,6 +14,8 @@ use tracing::{debug, error, trace, warn};
 
 const MAX_NFS_IO_BYTES: u32 = 1024 * 1024;
 const READDIR_REPLY_OVERHEAD: usize = 128;
+// An initial directory page must be able to advance past both `.` and `..`.
+const MIN_READDIR_ENTRIES: usize = 2;
 
 /// Helper function to create AuthContext from RPCContext
 fn auth_from_context(context: &RPCContext) -> AuthContext {
@@ -924,6 +926,12 @@ pub async fn nfsproc3_readdirplus(
     // This is hard to ballpark, so we just divide it by 16
     let max_dircount_bytes = (args.dircount as usize).min(max_bytes_allowed);
     let estimated_max_results = max_dircount_bytes / 16;
+    if estimated_max_results < MIN_READDIR_ENTRIES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    }
     let mut ctr = 0;
     match context
         .vfs
@@ -1076,6 +1084,12 @@ pub async fn nfsproc3_readdir(
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
     let estimated_max_results = max_bytes_allowed / 16;
+    if estimated_max_results < MIN_READDIR_ENTRIES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    }
     let mut ctr = 0;
     match context
         .vfs

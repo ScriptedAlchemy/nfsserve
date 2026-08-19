@@ -1158,20 +1158,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readdir_rejects_a_count_smaller_than_reply_overhead() {
-        let fs = Arc::new(BlockingWriteFs::new());
-        let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, false, 127, 0)).await;
+    async fn readdir_rejects_counts_that_cannot_fit_required_entries() {
+        for count in [127, 128, 129, 143, 144, 159] {
+            let fs = Arc::new(BlockingWriteFs::new());
+            let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, false, count, 0)).await;
 
-        assert_eq!(nfs_status(&reply), nfsstat3::NFS3ERR_TOOSMALL as u32);
-        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                nfs_status(&reply),
+                nfsstat3::NFS3ERR_TOOSMALL as u32,
+                "count {count}"
+            );
+            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0, "count {count}");
+        }
     }
 
     #[tokio::test]
-    async fn readdirplus_rejects_a_maxcount_smaller_than_reply_overhead() {
-        let fs = Arc::new(BlockingWriteFs::new());
-        let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, true, u32::MAX, 127)).await;
+    async fn readdirplus_rejects_counts_that_cannot_fit_required_entries() {
+        for count in [127, 128, 129, 143, 144, 159] {
+            let fs = Arc::new(BlockingWriteFs::new());
+            let reply =
+                execute_one_call(Arc::clone(&fs), readdir_call(1, true, count, count)).await;
 
-        assert_eq!(nfs_status(&reply), nfsstat3::NFS3ERR_TOOSMALL as u32);
-        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                nfs_status(&reply),
+                nfsstat3::NFS3ERR_TOOSMALL as u32,
+                "count {count}"
+            );
+            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0, "count {count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_accepts_the_minimum_progress_budget() {
+        for plus in [false, true] {
+            let fs = Arc::new(BlockingWriteFs::new());
+            let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, plus, 160, 160)).await;
+
+            assert_eq!(nfs_status(&reply), nfsstat3::NFS3_OK as u32);
+            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fs.readdir_max_entries.load(Ordering::SeqCst), 2);
+        }
     }
 }

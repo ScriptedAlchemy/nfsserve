@@ -16,15 +16,17 @@ use std::{io, net::IpAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-// Bound both sides of an RPC for its full wire lifetime. A WRITE request is
-// copied while XDR and the VFS adapter decode it; a READ reply is resident
-// until the client consumes it, so neither a count-only nor a request-only
-// limit is sufficient.
+// Bound both sides of an RPC for its full wire lifetime. These are wire-byte
+// credits, not an RSS limit: XDR and VFS decoding can create additional owned
+// copies. The credits make that amplification finite. A READ reply remains
+// charged until the client consumes it, so neither a count-only nor a
+// request-only limit is sufficient.
 const MAX_INFLIGHT_REQUESTS: usize = 32;
-const MAX_RPC_RECORD_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_RPC_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const CONNECTION_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const GLOBAL_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -390,11 +392,19 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
     /// Handles incoming connections until shutdown is signaled.
     async fn handle_with_shutdown(&self, shutdown: CancellationToken) -> io::Result<()> {
+        let mut clients = JoinSet::new();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("NFS TCP server shutting down on {}", self.listener.local_addr().unwrap());
                     break;
+                }
+                Some(result) = clients.join_next(), if !clients.is_empty() => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => debug!("NFS client handler stopped: {error:#}"),
+                        Err(error) => debug!("NFS client handler task failed: {error}"),
+                    }
                 }
                 result = self.listener.accept() => {
                     let (socket, _) = result?;
@@ -411,19 +421,21 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                     debug!("Accepting socket {:?} {:?}", socket, context);
                     let client_shutdown = shutdown.child_token();
                     let global_budget = Arc::clone(&self.transport_budget);
-                    tokio::spawn(async move {
-                        if let Err(error) = process_socket(
-                            socket,
-                            context,
-                            client_shutdown,
-                            global_budget,
-                        )
-                        .await
-                        {
-                            debug!("NFS client handler stopped: {error:#}");
-                        }
-                    });
+                    clients.spawn(process_socket(
+                        socket,
+                        context,
+                        client_shutdown,
+                        global_budget,
+                    ));
                 }
+            }
+        }
+
+        while let Some(result) = clients.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => debug!("NFS client handler stopped during shutdown: {error:#}"),
+                Err(error) => debug!("NFS client handler task failed during shutdown: {error}"),
             }
         }
 
@@ -444,6 +456,8 @@ mod tests {
     struct BlockingWriteFs {
         started: AtomicUsize,
         reads: AtomicUsize,
+        readdir_calls: AtomicUsize,
+        readdir_max_entries: AtomicUsize,
         started_notify: Notify,
         release: Semaphore,
     }
@@ -453,6 +467,8 @@ mod tests {
             Self {
                 started: AtomicUsize::new(0),
                 reads: AtomicUsize::new(0),
+                readdir_calls: AtomicUsize::new(0),
+                readdir_max_entries: AtomicUsize::new(0),
                 started_notify: Notify::new(),
                 release: Semaphore::new(0),
             }
@@ -570,9 +586,15 @@ mod tests {
             _: &AuthContext,
             _: fileid3,
             _: fileid3,
-            _: usize,
+            max_entries: usize,
         ) -> Result<ReadDirResult, nfsstat3> {
-            Err(nfsstat3::NFS3ERR_NOTSUPP)
+            self.readdir_calls.fetch_add(1, Ordering::SeqCst);
+            self.readdir_max_entries
+                .store(max_entries, Ordering::SeqCst);
+            Ok(ReadDirResult {
+                entries: Vec::new(),
+                end: true,
+            })
         }
 
         async fn symlink(
@@ -658,6 +680,34 @@ mod tests {
         call
     }
 
+    fn readdir_call(xid: u32, plus: bool, dircount: u32, maxcount: u32) -> Vec<u8> {
+        let mut call = Vec::with_capacity(96);
+        for value in [
+            xid,
+            0,
+            2,
+            100003,
+            3,
+            if plus { 17 } else { 16 },
+            0,
+            0,
+            0,
+            0,
+            16,
+        ] {
+            call.extend_from_slice(&value.to_be_bytes());
+        }
+        call.extend_from_slice(&0u64.to_le_bytes());
+        call.extend_from_slice(&1u64.to_le_bytes());
+        call.extend_from_slice(&0u64.to_be_bytes()); // cookie
+        call.extend_from_slice(&[0; 8]); // cookie verifier
+        call.extend_from_slice(&dircount.to_be_bytes());
+        if plus {
+            call.extend_from_slice(&maxcount.to_be_bytes());
+        }
+        call
+    }
+
     fn test_context(fs: Arc<BlockingWriteFs>) -> RPCContext {
         RPCContext {
             local_port: 2049,
@@ -683,6 +733,32 @@ mod tests {
         let mut record = vec![0; length];
         socket.read_exact(&mut record).await?;
         Ok(record)
+    }
+
+    async fn execute_one_call(fs: Arc<BlockingWriteFs>, call: Vec<u8>) -> Vec<u8> {
+        let context = test_context(fs);
+        let limits = TransportLimits::default();
+        let global_budget = Arc::new(Semaphore::new(GLOBAL_INFLIGHT_BYTES));
+        let (server_socket, client_socket) = tokio::io::duplex(4 * 1024 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            context,
+            CancellationToken::new(),
+            limits,
+            global_budget,
+        ));
+        send_record(&mut client_writer, &call).await;
+        client_writer.shutdown().await.unwrap();
+        let reply = read_record(&mut client_reader).await.unwrap();
+        server.await.unwrap().unwrap();
+        reply
+    }
+
+    fn nfs_status(reply: &[u8]) -> u32 {
+        u32::from_be_bytes(reply[24..28].try_into().unwrap())
     }
 
     #[tokio::test]
@@ -719,6 +795,45 @@ mod tests {
             thirty_third_started.is_err(),
             "more than 32 blocked NFS RPCs entered the filesystem"
         );
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_waits_for_an_accepted_write() {
+        let fs = BlockingWriteFs::new();
+        let listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), fs)
+            .await
+            .unwrap();
+        let port = listener.get_listen_port();
+        let fs = Arc::clone(&listener.arcfs);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let mut server = tokio::spawn(async move {
+            listener
+                .handle_with_shutdown(server_shutdown)
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        send_record(&mut client, &write_call(1, 64 * 1024)).await;
+        tokio::time::timeout(Duration::from_secs(1), fs.wait_for_started(1))
+            .await
+            .unwrap();
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut server)
+                .await
+                .is_err(),
+            "listener returned before its accepted write settled"
+        );
+
+        fs.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener did not join the drained connection")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1022,5 +1137,41 @@ mod tests {
         server.await.unwrap().unwrap();
 
         assert_eq!(fs.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn readdir_caps_client_count_before_calling_the_filesystem() {
+        let fs = Arc::new(BlockingWriteFs::new());
+        execute_one_call(Arc::clone(&fs), readdir_call(1, false, u32::MAX, 0)).await;
+
+        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
+        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= (MAX_RPC_RECORD_BYTES - 128) / 16);
+    }
+
+    #[tokio::test]
+    async fn readdirplus_caps_both_client_counts_before_calling_the_filesystem() {
+        let fs = Arc::new(BlockingWriteFs::new());
+        execute_one_call(Arc::clone(&fs), readdir_call(1, true, u32::MAX, u32::MAX)).await;
+
+        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
+        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= (MAX_RPC_RECORD_BYTES - 128) / 16);
+    }
+
+    #[tokio::test]
+    async fn readdir_rejects_a_count_smaller_than_reply_overhead() {
+        let fs = Arc::new(BlockingWriteFs::new());
+        let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, false, 127, 0)).await;
+
+        assert_eq!(nfs_status(&reply), nfsstat3::NFS3ERR_TOOSMALL as u32);
+        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn readdirplus_rejects_a_maxcount_smaller_than_reply_overhead() {
+        let fs = Arc::new(BlockingWriteFs::new());
+        let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, true, u32::MAX, 127)).await;
+
+        assert_eq!(nfs_status(&reply), nfsstat3::NFS3ERR_TOOSMALL as u32);
+        assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0);
     }
 }

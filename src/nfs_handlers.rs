@@ -3,6 +3,7 @@
 use crate::context::RPCContext;
 use crate::nfs;
 use crate::rpc::*;
+use crate::tcp::MAX_RPC_RECORD_BYTES;
 use crate::vfs::{AuthContext, VFSCapabilities};
 use crate::xdr::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -12,6 +13,7 @@ use std::io::{Read, Write};
 use tracing::{debug, error, trace, warn};
 
 const MAX_NFS_IO_BYTES: u32 = 1024 * 1024;
+const READDIR_REPLY_OVERHEAD: usize = 128;
 
 /// Helper function to create AuthContext from RPCContext
 fn auth_from_context(context: &RPCContext) -> AuthContext {
@@ -906,12 +908,22 @@ pub async fn nfsproc3_readdirplus(
         dir_attr.serialize(output)?;
         return Ok(());
     }*/
-    // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.maxcount as usize - 128;
+    // Reserve fixed reply framing and cap client-controlled counts to the
+    // transport's maximum reply record before asking the filesystem for data.
+    let max_reply_bytes = (args.maxcount as usize).min(MAX_RPC_RECORD_BYTES);
+    let Some(max_bytes_allowed) = max_reply_bytes
+        .checked_sub(READDIR_REPLY_OVERHEAD)
+        .filter(|bytes| *bytes > 0)
+    else {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    };
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
-    let max_dircount_bytes = args.dircount as usize;
+    let max_dircount_bytes = (args.dircount as usize).min(max_bytes_allowed);
+    let estimated_max_results = max_dircount_bytes / 16;
     let mut ctr = 0;
     match context
         .vfs
@@ -919,7 +931,7 @@ pub async fn nfsproc3_readdirplus(
             &auth_from_context(context),
             dirid,
             args.cookie,
-            estimated_max_results as usize,
+            estimated_max_results,
         )
         .await
     {
@@ -960,8 +972,13 @@ pub async fn nfsproc3_readdirplus(
                                     + std::mem::size_of::<nfs::cookie3>(); // cookie
                 let added_output_bytes = write_buf.len();
                 // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed
-                    && added_dircount + accumulated_dircount < max_dircount_bytes
+                if counting_output
+                    .bytes_written()
+                    .checked_add(added_output_bytes)
+                    .is_some_and(|bytes| bytes <= max_bytes_allowed)
+                    && accumulated_dircount
+                        .checked_add(added_dircount)
+                        .is_some_and(|bytes| bytes <= max_dircount_bytes)
                 {
                     trace!("  -- dirent {:?}", entry);
                     // commit the entry
@@ -1044,11 +1061,21 @@ pub async fn nfsproc3_readdir(
     debug!(" -- Dir attr {:?}", dir_attr);
     debug!(" -- Dir version {:?}", dirversion);
     let has_version = args.cookieverf != nfs::cookieverf3::default();
-    // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.dircount as usize - 128;
+    // Reserve fixed reply framing and cap the client-controlled count before
+    // using it to size the filesystem query or output.
+    let max_reply_bytes = (args.dircount as usize).min(MAX_RPC_RECORD_BYTES);
+    let Some(max_bytes_allowed) = max_reply_bytes
+        .checked_sub(READDIR_REPLY_OVERHEAD)
+        .filter(|bytes| *bytes > 0)
+    else {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    };
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
+    let estimated_max_results = max_bytes_allowed / 16;
     let mut ctr = 0;
     match context
         .vfs
@@ -1056,7 +1083,7 @@ pub async fn nfsproc3_readdir(
             &auth_from_context(context),
             dirid,
             args.cookie,
-            estimated_max_results as usize,
+            estimated_max_results,
         )
         .await
     {
@@ -1091,7 +1118,11 @@ pub async fn nfsproc3_readdir(
                                     + std::mem::size_of::<nfs::cookie3>(); // cookie
                 let added_output_bytes = write_buf.len();
                 // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed {
+                if counting_output
+                    .bytes_written()
+                    .checked_add(added_output_bytes)
+                    .is_some_and(|bytes| bytes <= max_bytes_allowed)
+                {
                     trace!("  -- dirent {:?}", entry);
                     // commit the entry
                     ctr += 1;

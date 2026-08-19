@@ -1,5 +1,5 @@
 use crate::context::RPCContext;
-use crate::rpcwire::{handle_rpc, write_fragment};
+use crate::rpcwire::handle_rpc;
 use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
 use anyhow;
@@ -10,11 +10,11 @@ use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{io, net::IpAddr};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -30,6 +30,14 @@ const MAX_INFLIGHT_REQUESTS: usize = 32;
 pub(crate) const MAX_RPC_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const CONNECTION_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const GLOBAL_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
+// A partial first record can charge one full record per connection. Preserve
+// half the global budget for clients that are still making progress.
+const MAX_ACTIVE_CONNECTIONS: usize = GLOBAL_INFLIGHT_BYTES / MAX_RPC_RECORD_BYTES / 2;
+const HEADER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const FRAGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const RECORD_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(120);
+const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 static NEXT_CONNECTION_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
@@ -38,6 +46,12 @@ struct TransportLimits {
     max_inflight_requests: usize,
     max_record_bytes: usize,
     connection_inflight_bytes: usize,
+    max_connections: usize,
+    header_idle_timeout: Duration,
+    fragment_idle_timeout: Duration,
+    record_assembly_timeout: Duration,
+    reply_idle_timeout: Duration,
+    reply_total_timeout: Duration,
 }
 
 impl Default for TransportLimits {
@@ -46,6 +60,12 @@ impl Default for TransportLimits {
             max_inflight_requests: MAX_INFLIGHT_REQUESTS,
             max_record_bytes: MAX_RPC_RECORD_BYTES,
             connection_inflight_bytes: CONNECTION_INFLIGHT_BYTES,
+            max_connections: MAX_ACTIVE_CONNECTIONS,
+            header_idle_timeout: HEADER_IDLE_TIMEOUT,
+            fragment_idle_timeout: FRAGMENT_IDLE_TIMEOUT,
+            record_assembly_timeout: RECORD_ASSEMBLY_TIMEOUT,
+            reply_idle_timeout: REPLY_IDLE_TIMEOUT,
+            reply_total_timeout: REPLY_TOTAL_TIMEOUT,
         }
     }
 }
@@ -73,6 +93,8 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
     transport_budget: Arc<Semaphore>,
+    connection_slots: Arc<Semaphore>,
+    transport_limits: TransportLimits,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -88,27 +110,122 @@ async fn process_socket(
     socket: tokio::net::TcpStream,
     context: RPCContext,
     shutdown: CancellationToken,
+    limits: TransportLimits,
     global_budget: Arc<Semaphore>,
+    _connection_slot: OwnedSemaphorePermit,
 ) -> Result<(), anyhow::Error> {
     let _ = socket.set_nodelay(true);
     let (reader, writer) = socket.into_split();
-    process_stream(
-        reader,
-        writer,
-        context,
-        shutdown,
-        TransportLimits::default(),
-        global_budget,
-    )
-    .await
+    process_stream(reader, writer, context, shutdown, limits, global_budget).await
 }
 
-async fn read_first_marker<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<u32>> {
-    let mut marker = [0_u8; 4];
-    if reader.read(&mut marker[..1]).await? == 0 {
-        return Ok(None);
+async fn read_with_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Duration,
+    phase: &'static str,
+) -> io::Result<usize> {
+    tokio::time::timeout(idle_timeout, reader.read(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{phase} idle timeout")))?
+}
+
+async fn read_exact_with_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut buf: &mut [u8],
+    idle_timeout: Duration,
+    phase: &'static str,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        let read = read_with_idle_timeout(reader, buf, idle_timeout, phase).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("connection closed during {phase}"),
+            ));
+        }
+        buf = &mut buf[read..];
     }
-    reader.read_exact(&mut marker[1..]).await?;
+    Ok(())
+}
+
+async fn write_all_with_idle_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut buf: &[u8],
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        let written = tokio::time::timeout(idle_timeout, writer.write(buf))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RPC reply idle timeout"))??;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "connection stopped accepting an RPC reply",
+            ));
+        }
+        buf = &buf[written..];
+    }
+    Ok(())
+}
+
+async fn write_record_with_idle_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    reply: &[u8],
+    idle_timeout: Duration,
+) -> anyhow::Result<()> {
+    let length = u32::try_from(reply.len())
+        .map_err(|_| anyhow::anyhow!("RPC reply length exceeds record marker capacity"))?;
+    if length >= 1 << 31 {
+        return Err(anyhow::anyhow!(
+            "RPC reply length exceeds record marker capacity"
+        ));
+    }
+    let marker = (length | (1 << 31)).to_be_bytes();
+    write_all_with_idle_timeout(writer, &marker, idle_timeout).await?;
+    write_all_with_idle_timeout(writer, reply, idle_timeout).await?;
+    Ok(())
+}
+
+async fn write_record_with_deadlines<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    reply: &[u8],
+    idle_timeout: Duration,
+    total_timeout: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        total_timeout,
+        write_record_with_idle_timeout(writer, reply, idle_timeout),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("RPC reply total timeout"))?
+}
+
+async fn read_first_marker<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    idle_timeout: Duration,
+) -> io::Result<Option<u32>> {
+    let mut marker = [0_u8; 4];
+    let mut filled = 0;
+    while filled < marker.len() {
+        let read = read_with_idle_timeout(
+            reader,
+            &mut marker[filled..],
+            idle_timeout,
+            "RPC record header",
+        )
+        .await?;
+        if read == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed during RPC record header",
+            ));
+        }
+        filled += read;
+    }
     Ok(Some(u32::from_be_bytes(marker)))
 }
 
@@ -118,7 +235,21 @@ async fn read_admitted_record<R: AsyncRead + Unpin>(
     connection_budget: Arc<Semaphore>,
     global_budget: Arc<Semaphore>,
 ) -> anyhow::Result<Option<AdmittedRecord>> {
-    let Some(mut marker) = read_first_marker(reader).await? else {
+    tokio::time::timeout(
+        limits.record_assembly_timeout,
+        read_admitted_record_inner(reader, limits, connection_budget, global_budget),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("RPC record assembly timeout"))?
+}
+
+async fn read_admitted_record_inner<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limits: TransportLimits,
+    connection_budget: Arc<Semaphore>,
+    global_budget: Arc<Semaphore>,
+) -> anyhow::Result<Option<AdmittedRecord>> {
+    let Some(mut marker) = read_first_marker(reader, limits.header_idle_timeout).await? else {
         return Ok(None);
     };
     let first_length = (marker & 0x7fff_ffff) as usize;
@@ -158,9 +289,13 @@ async fn read_admitted_record<R: AsyncRead + Unpin>(
             .try_reserve_exact(length)
             .map_err(|error| anyhow::anyhow!("unable to reserve RPC record: {error}"))?;
         record.resize(new_length, 0);
-        reader
-            .read_exact(&mut record[new_length - length..])
-            .await?;
+        read_exact_with_idle_timeout(
+            reader,
+            &mut record[new_length - length..],
+            limits.fragment_idle_timeout,
+            "RPC record fragment",
+        )
+        .await?;
         if is_last {
             return Ok(Some(AdmittedRecord {
                 bytes: record,
@@ -168,7 +303,13 @@ async fn read_admitted_record<R: AsyncRead + Unpin>(
             }));
         }
         let mut next_marker = [0_u8; 4];
-        reader.read_exact(&mut next_marker).await?;
+        read_exact_with_idle_timeout(
+            reader,
+            &mut next_marker,
+            limits.header_idle_timeout,
+            "RPC record header",
+        )
+        .await?;
         marker = u32::from_be_bytes(next_marker);
     }
 }
@@ -205,8 +346,7 @@ where
     assert!(limits.max_record_bytes > 0);
     assert!(limits.connection_inflight_bytes >= limits.max_record_bytes);
     let connection_budget = Arc::new(Semaphore::new(limits.connection_inflight_bytes));
-    let connection_incarnation =
-        NEXT_CONNECTION_INCARNATION.fetch_add(1, Ordering::Relaxed);
+    let connection_incarnation = NEXT_CONNECTION_INCARNATION.fetch_add(1, Ordering::Relaxed);
     let command_connection_budget = Arc::clone(&connection_budget);
     let command_global_budget = Arc::clone(&global_budget);
     // Keep read and write progress independently pollable. With one coupled
@@ -233,6 +373,8 @@ where
     ));
     let (reply_tx, reply_rx) = mpsc::channel::<Reply>(limits.max_inflight_requests);
     let reply_limit = limits.max_record_bytes;
+    let reply_idle_timeout = limits.reply_idle_timeout;
+    let reply_total_timeout = limits.reply_total_timeout;
     let mut replies = Box::pin(stream::unfold(
         (writer, reply_rx, false),
         move |(mut writer, mut receiver, writer_failed)| async move {
@@ -245,7 +387,13 @@ where
                     reply.len()
                 ))
             } else {
-                write_fragment(&mut writer, &reply).await
+                write_record_with_deadlines(
+                    &mut writer,
+                    &reply,
+                    reply_idle_timeout,
+                    reply_total_timeout,
+                )
+                .await
             };
             drop(credit);
             let writer_failed = writer_failed || result.is_err();
@@ -358,6 +506,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             SocketAddr::V4(s) => s.port(),
             SocketAddr::V6(s) => s.port(),
         };
+        let transport_limits = TransportLimits::default();
         Ok(NFSTcpListener {
             listener,
             port,
@@ -366,6 +515,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
             transport_budget: Arc::new(Semaphore::new(GLOBAL_INFLIGHT_BYTES)),
+            connection_slots: Arc::new(Semaphore::new(transport_limits.max_connections)),
+            transport_limits,
         })
     }
 
@@ -408,6 +559,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
     /// Handles incoming connections until shutdown is signaled.
     async fn handle_with_shutdown(&self, shutdown: CancellationToken) -> io::Result<()> {
         let mut clients = JoinSet::new();
+        let mut accept_error = None;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -421,8 +573,17 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                         Err(error) => debug!("NFS client handler task failed: {error}"),
                     }
                 }
-                result = self.listener.accept() => {
-                    let (socket, _) = result?;
+                result = self.listener.accept(), if self.connection_slots.available_permits() > 0 => {
+                    let (socket, _) = match result {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            accept_error = Some(error);
+                            break;
+                        }
+                    };
+                    let connection_slot = Arc::clone(&self.connection_slots)
+                        .try_acquire_owned()
+                        .map_err(|_| io::Error::other("NFS connection admission race"))?;
                     let context = RPCContext {
                         local_port: self.port,
                         client_addr: socket.peer_addr().unwrap().to_string(),
@@ -440,7 +601,9 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                         socket,
                         context,
                         client_shutdown,
+                        self.transport_limits,
                         global_budget,
+                        connection_slot,
                     ));
                 }
             }
@@ -454,19 +617,96 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             }
         }
 
-        Ok(())
+        match accept_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, sattr3, specdata3};
-    use crate::vfs::{AuthContext, ReadDirResult, VFSCapabilities};
+    use crate::nfs::{
+        fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, sattr3, specdata3, stable_how,
+    };
+    use crate::vfs::test_support::ContextRecordingFs;
+    use crate::vfs::{AuthContext, DirEntry, ReadDirResult, VFSCapabilities};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::{Notify, Semaphore};
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct DripWriter {
+        delay: Duration,
+        sleep: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl DripWriter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            }
+        }
+    }
+
+    impl AsyncWrite for DripWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.sleep.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            let delay = self.delay;
+            self.sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + delay);
+            std::task::Poll::Ready(Ok(buf.len().min(1)))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     struct BlockingWriteFs {
         started: AtomicUsize,
@@ -606,9 +846,30 @@ mod tests {
             self.readdir_calls.fetch_add(1, Ordering::SeqCst);
             self.readdir_max_entries
                 .store(max_entries, Ordering::SeqCst);
+            let entries = [
+                DirEntry {
+                    fileid: 1,
+                    name: crate::nfs::nfsstring(b".".to_vec()),
+                    attr: fattr3 {
+                        fileid: 1,
+                        ..fattr3::default()
+                    },
+                    cookie: 1,
+                },
+                DirEntry {
+                    fileid: 1,
+                    name: crate::nfs::nfsstring(b"..".to_vec()),
+                    attr: fattr3 {
+                        fileid: 1,
+                        ..fattr3::default()
+                    },
+                    cookie: 2,
+                },
+            ];
+            let end = max_entries >= entries.len();
             Ok(ReadDirResult {
-                entries: Vec::new(),
-                end: true,
+                entries: entries.into_iter().take(max_entries).collect(),
+                end,
             })
         }
 
@@ -772,8 +1033,446 @@ mod tests {
         reply
     }
 
+    async fn wait_for_permits(semaphore: &Semaphore, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while semaphore.available_permits() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "semaphore has {} permits, expected {expected}",
+                semaphore.available_permits()
+            )
+        });
+    }
+
     fn nfs_status(reply: &[u8]) -> u32 {
         u32::from_be_bytes(reply[24..28].try_into().unwrap())
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ParsedDirectoryReply {
+        names: Vec<Vec<u8>>,
+        eof: bool,
+    }
+
+    fn take_u32(reply: &[u8], offset: &mut usize) -> u32 {
+        let value = u32::from_be_bytes(reply[*offset..*offset + 4].try_into().unwrap());
+        *offset += 4;
+        value
+    }
+
+    fn skip_bytes(reply: &[u8], offset: &mut usize, bytes: usize) {
+        assert!(*offset + bytes <= reply.len());
+        *offset += bytes;
+    }
+
+    fn parse_directory_reply(reply: &[u8], plus: bool) -> ParsedDirectoryReply {
+        assert_eq!(nfs_status(reply), nfsstat3::NFS3_OK as u32);
+        let mut offset = 28;
+        let attributes_follow = take_u32(reply, &mut offset) != 0;
+        if attributes_follow {
+            skip_bytes(reply, &mut offset, 84);
+        }
+        skip_bytes(reply, &mut offset, 8); // cookie verifier
+
+        let mut names = Vec::new();
+        while take_u32(reply, &mut offset) != 0 {
+            skip_bytes(reply, &mut offset, 8); // fileid
+            let name_len = take_u32(reply, &mut offset) as usize;
+            let name = reply[offset..offset + name_len].to_vec();
+            skip_bytes(reply, &mut offset, name_len.div_ceil(4) * 4);
+            skip_bytes(reply, &mut offset, 8); // cookie
+            if plus {
+                let entry_attributes_follow = take_u32(reply, &mut offset) != 0;
+                if entry_attributes_follow {
+                    skip_bytes(reply, &mut offset, 84);
+                }
+                let handle_follows = take_u32(reply, &mut offset) != 0;
+                if handle_follows {
+                    let handle_len = take_u32(reply, &mut offset) as usize;
+                    skip_bytes(reply, &mut offset, handle_len.div_ceil(4) * 4);
+                }
+            }
+            names.push(name);
+        }
+        let eof = take_u32(reply, &mut offset) != 0;
+        assert_eq!(offset, reply.len(), "unparsed directory reply bytes");
+        ParsedDirectoryReply { names, eof }
+    }
+
+    #[tokio::test]
+    async fn partial_header_times_out_without_consuming_wire_credit() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            header_idle_timeout: Duration::from_millis(40),
+            fragment_idle_timeout: Duration::from_millis(40),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_socket, mut client) = tokio::io::duplex(64);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        client.write_all(&[0x80]).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("partial header did not hit its idle deadline")
+            .unwrap()
+            .expect_err("partial header unexpectedly succeeded");
+
+        assert!(error.to_string().contains("header idle timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn partial_fragment_times_out_and_releases_wire_credit() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            header_idle_timeout: Duration::from_millis(40),
+            fragment_idle_timeout: Duration::from_millis(40),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_socket, mut client) = tokio::io::duplex(64);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        client
+            .write_all(&((64_u32) | (1 << 31)).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&[0]).await.unwrap();
+        wait_for_permits(&global_budget, 0).await;
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("partial fragment did not hit its idle deadline")
+            .unwrap()
+            .expect_err("partial fragment unexpectedly succeeded");
+
+        assert!(error.to_string().contains("fragment idle timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn partial_continuation_header_times_out_and_releases_wire_credit() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            header_idle_timeout: Duration::from_millis(40),
+            fragment_idle_timeout: Duration::from_millis(40),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_socket, mut client) = tokio::io::duplex(64);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        client.write_all(&0_u32.to_be_bytes()).await.unwrap();
+        client.write_all(&[0x80]).await.unwrap();
+        wait_for_permits(&global_budget, 0).await;
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("partial continuation header did not hit its idle deadline")
+            .unwrap()
+            .expect_err("partial continuation header unexpectedly succeeded");
+
+        assert!(error.to_string().contains("header idle timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn drip_fed_record_hits_its_total_assembly_deadline() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            header_idle_timeout: Duration::from_millis(40),
+            fragment_idle_timeout: Duration::from_millis(40),
+            record_assembly_timeout: Duration::from_millis(90),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_socket, mut client) = tokio::io::duplex(64);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        let drip = tokio::spawn(async move {
+            for byte in [0x80, 0, 0, 64, 0, 0] {
+                if client.write_all(&[byte]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("drip-fed record exceeded its total assembly deadline")
+            .unwrap()
+            .expect_err("drip-fed record unexpectedly succeeded");
+        drip.abort();
+        let _ = drip.await;
+
+        assert!(error.to_string().contains("record assembly timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn stalled_reply_times_out_and_releases_wire_credit_during_shutdown() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            reply_idle_timeout: Duration::from_millis(40),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_reader, mut client) = tokio::io::duplex(256);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            PendingWriter,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            server_shutdown,
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        send_record(&mut client, &null_call(1)).await;
+        wait_for_permits(&global_budget, 0).await;
+        shutdown.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("stalled reply prevented shutdown from settling")
+            .unwrap()
+            .expect_err("stalled reply unexpectedly succeeded");
+
+        assert!(error.to_string().contains("reply idle timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn drip_drained_reply_hits_its_total_deadline_during_shutdown() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            reply_idle_timeout: Duration::from_millis(40),
+            reply_total_timeout: Duration::from_millis(90),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
+        let (server_reader, mut client) = tokio::io::duplex(256);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(process_stream(
+            server_reader,
+            DripWriter::new(Duration::from_millis(25)),
+            test_context(Arc::new(BlockingWriteFs::new())),
+            server_shutdown,
+            limits,
+            Arc::clone(&global_budget),
+        ));
+
+        send_record(&mut client, &null_call(1)).await;
+        wait_for_permits(&global_budget, 0).await;
+        shutdown.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(250), server)
+            .await
+            .expect("drip-drained reply prevented shutdown from settling")
+            .unwrap()
+            .expect_err("drip-drained reply unexpectedly succeeded");
+
+        assert!(error.to_string().contains("reply total timeout"));
+        assert_eq!(global_budget.available_permits(), RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn valid_client_progresses_after_stalled_peers_release_credit() {
+        const RECORD_LIMIT: usize = 1024;
+        let limits = TransportLimits {
+            max_record_bytes: RECORD_LIMIT,
+            connection_inflight_bytes: RECORD_LIMIT,
+            header_idle_timeout: Duration::from_millis(50),
+            fragment_idle_timeout: Duration::from_millis(50),
+            ..TransportLimits::default()
+        };
+        let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
+        let mut stalled_servers = Vec::new();
+        let mut stalled_clients = Vec::new();
+        for _ in 0..2 {
+            let (server_socket, mut client) = tokio::io::duplex(64);
+            let (server_reader, server_writer) = tokio::io::split(server_socket);
+            stalled_servers.push(tokio::spawn(process_stream(
+                server_reader,
+                server_writer,
+                test_context(Arc::new(BlockingWriteFs::new())),
+                CancellationToken::new(),
+                limits,
+                Arc::clone(&global_budget),
+            )));
+            client
+                .write_all(&((64_u32) | (1 << 31)).to_be_bytes())
+                .await
+                .unwrap();
+            client.write_all(&[0]).await.unwrap();
+            stalled_clients.push(client);
+        }
+        wait_for_permits(&global_budget, 0).await;
+
+        let (server_socket, client_socket) = tokio::io::duplex(4096);
+        let (server_reader, server_writer) = tokio::io::split(server_socket);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_socket);
+        let valid_server = tokio::spawn(process_stream(
+            server_reader,
+            server_writer,
+            test_context(Arc::new(BlockingWriteFs::new())),
+            CancellationToken::new(),
+            limits,
+            Arc::clone(&global_budget),
+        ));
+        send_record(&mut client_writer, &null_call(99)).await;
+        let reply =
+            tokio::time::timeout(Duration::from_millis(500), read_record(&mut client_reader))
+                .await
+                .expect("valid client starved behind stalled peers")
+                .unwrap();
+        assert_eq!(u32::from_be_bytes(reply[..4].try_into().unwrap()), 99);
+        client_writer.shutdown().await.unwrap();
+        valid_server.await.unwrap().unwrap();
+
+        for server in stalled_servers {
+            assert!(server.await.unwrap().is_err());
+        }
+        drop(stalled_clients);
+        assert_eq!(global_budget.available_permits(), 2 * RECORD_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn listener_admission_bounds_partial_record_connections() {
+        let fs = BlockingWriteFs::new();
+        let mut listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), fs)
+            .await
+            .unwrap();
+        listener.transport_limits.max_connections = 1;
+        listener.connection_slots = Arc::new(Semaphore::new(1));
+        let connection_slots = Arc::clone(&listener.connection_slots);
+        let global_budget = Arc::clone(&listener.transport_budget);
+        let initial_budget = global_budget.available_permits();
+        let port = listener.get_listen_port();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server =
+            tokio::spawn(async move { listener.handle_with_shutdown(server_shutdown).await });
+
+        let mut first = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        first
+            .write_all(&((64_u32) | (1 << 31)).to_be_bytes())
+            .await
+            .unwrap();
+        first.write_all(&[0]).await.unwrap();
+        wait_for_permits(&global_budget, initial_budget - MAX_RPC_RECORD_BYTES).await;
+
+        let mut second = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        second
+            .write_all(&((64_u32) | (1 << 31)).to_be_bytes())
+            .await
+            .unwrap();
+        second.write_all(&[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            global_budget.available_permits(),
+            initial_budget - MAX_RPC_RECORD_BYTES,
+            "listener accepted more partial-record peers than its connection bound"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(connection_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn listener_admits_a_valid_client_after_a_stalled_slot_expires() {
+        let fs = BlockingWriteFs::new();
+        let mut listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), fs)
+            .await
+            .unwrap();
+        listener.transport_limits.max_connections = 1;
+        listener.transport_limits.header_idle_timeout = Duration::from_millis(100);
+        listener.transport_limits.fragment_idle_timeout = Duration::from_millis(100);
+        listener.connection_slots = Arc::new(Semaphore::new(1));
+        let connection_slots = Arc::clone(&listener.connection_slots);
+        let port = listener.get_listen_port();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server =
+            tokio::spawn(async move { listener.handle_with_shutdown(server_shutdown).await });
+
+        let mut stalled = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stalled.write_all(&[0x80]).await.unwrap();
+        wait_for_permits(&connection_slots, 0).await;
+        let mut valid = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        send_record(&mut valid, &null_call(77)).await;
+        let reply = tokio::time::timeout(Duration::from_millis(500), read_record(&mut valid))
+            .await
+            .expect("valid client remained blocked behind an expired connection slot")
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(reply[..4].try_into().unwrap()), 77);
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -852,6 +1551,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_tcp_connections_receive_distinct_request_incarnations() {
+        let fs = ContextRecordingFs::new(stable_how::UNSTABLE, [3; 8]);
+        let writes = Arc::clone(&fs.writes);
+        let listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), fs)
+            .await
+            .unwrap();
+        let port = listener.get_listen_port();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server =
+            tokio::spawn(async move { listener.handle_with_shutdown(server_shutdown).await });
+
+        for xid in [11, 12] {
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            send_record(&mut client, &write_call(xid, 16)).await;
+            read_record(&mut client).await.unwrap();
+        }
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].xid, 11);
+        assert_eq!(writes[1].xid, 12);
+        assert_ne!(
+            writes[0].connection_incarnation,
+            writes[1].connection_incarnation
+        );
+    }
+
+    #[tokio::test]
     async fn write_ingress_stops_at_the_byte_limit() {
         const RECORD_LIMIT: usize = 128 * 1024;
         let fs = Arc::new(BlockingWriteFs::new());
@@ -860,6 +1596,7 @@ mod tests {
             max_inflight_requests: 8,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(8 * RECORD_LIMIT));
         let (server_socket, mut client) = tokio::io::duplex(1024 * 1024);
@@ -898,6 +1635,7 @@ mod tests {
             max_inflight_requests: 1,
             max_record_bytes: 1024,
             connection_inflight_bytes: 1024,
+            ..TransportLimits::default()
         };
         let connection_budget = Arc::new(Semaphore::new(1024));
         let global_budget = Arc::new(Semaphore::new(1024));
@@ -934,6 +1672,7 @@ mod tests {
             max_inflight_requests: 2,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
         let (server_socket, client_socket) = tokio::io::duplex(256);
@@ -982,6 +1721,7 @@ mod tests {
             max_inflight_requests: 2,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
         let (server_socket, mut client) = tokio::io::duplex(512 * 1024);
@@ -1022,6 +1762,7 @@ mod tests {
             max_inflight_requests: 1,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
         let (server_socket, _client) = tokio::io::duplex(64);
@@ -1055,6 +1796,7 @@ mod tests {
             max_inflight_requests: 2,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: 2 * RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(2 * RECORD_LIMIT));
         let (server_socket, mut client) = tokio::io::duplex(512 * 1024);
@@ -1095,6 +1837,7 @@ mod tests {
             max_inflight_requests: 4,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: 4 * RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(4 * RECORD_LIMIT));
         let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
@@ -1132,6 +1875,7 @@ mod tests {
             max_inflight_requests: 1,
             max_record_bytes: RECORD_LIMIT,
             connection_inflight_bytes: RECORD_LIMIT,
+            ..TransportLimits::default()
         };
         let global_budget = Arc::new(Semaphore::new(RECORD_LIMIT));
         let (server_socket, client_socket) = tokio::io::duplex(4096);
@@ -1160,7 +1904,7 @@ mod tests {
         execute_one_call(Arc::clone(&fs), readdir_call(1, false, u32::MAX, 0)).await;
 
         assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
-        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= (MAX_RPC_RECORD_BYTES - 128) / 16);
+        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= MAX_RPC_RECORD_BYTES / 24);
     }
 
     #[tokio::test]
@@ -1169,49 +1913,89 @@ mod tests {
         execute_one_call(Arc::clone(&fs), readdir_call(1, true, u32::MAX, u32::MAX)).await;
 
         assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
-        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= (MAX_RPC_RECORD_BYTES - 128) / 16);
+        assert!(fs.readdir_max_entries.load(Ordering::SeqCst) <= MAX_RPC_RECORD_BYTES / 120);
     }
 
     #[tokio::test]
-    async fn readdir_rejects_counts_that_cannot_fit_required_entries() {
-        for count in [127, 128, 129, 143, 144, 159] {
+    async fn readdir_uses_exact_wire_budget_and_makes_progress() {
+        for count in [127, 128, 129, 131] {
             let fs = Arc::new(BlockingWriteFs::new());
             let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, false, count, 0)).await;
-
             assert_eq!(
                 nfs_status(&reply),
                 nfsstat3::NFS3ERR_TOOSMALL as u32,
                 "count {count}"
             );
-            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0, "count {count}");
         }
+
+        for count in [132, 143, 144, 159] {
+            let fs = Arc::new(BlockingWriteFs::new());
+            let one = execute_one_call(fs, readdir_call(1, false, count, 0)).await;
+            assert_eq!(one.len(), 160, "count {count}");
+            assert_eq!(
+                parse_directory_reply(&one, false),
+                ParsedDirectoryReply {
+                    names: vec![b".".to_vec()],
+                    eof: false,
+                },
+                "count {count}"
+            );
+        }
+
+        let fs = Arc::new(BlockingWriteFs::new());
+        let two = execute_one_call(fs, readdir_call(2, false, 160, 0)).await;
+        assert_eq!(two.len(), 188);
+        assert_eq!(
+            parse_directory_reply(&two, false),
+            ParsedDirectoryReply {
+                names: vec![b".".to_vec(), b"..".to_vec()],
+                eof: true,
+            }
+        );
     }
 
     #[tokio::test]
-    async fn readdirplus_rejects_counts_that_cannot_fit_required_entries() {
-        for count in [127, 128, 129, 143, 144, 159] {
+    async fn readdirplus_uses_exact_dir_and_total_wire_budgets() {
+        for count in [127, 128, 129, 143, 144, 159, 160] {
             let fs = Arc::new(BlockingWriteFs::new());
             let reply =
                 execute_one_call(Arc::clone(&fs), readdir_call(1, true, count, count)).await;
-
             assert_eq!(
                 nfs_status(&reply),
                 nfsstat3::NFS3ERR_TOOSMALL as u32,
                 "count {count}"
             );
-            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 0, "count {count}");
         }
-    }
-
-    #[tokio::test]
-    async fn readdir_accepts_the_minimum_progress_budget() {
-        for plus in [false, true] {
+        for (dircount, maxcount) in [(35, 244), (36, 243)] {
             let fs = Arc::new(BlockingWriteFs::new());
-            let reply = execute_one_call(Arc::clone(&fs), readdir_call(1, plus, 160, 160)).await;
-
-            assert_eq!(nfs_status(&reply), nfsstat3::NFS3_OK as u32);
-            assert_eq!(fs.readdir_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(fs.readdir_max_entries.load(Ordering::SeqCst), 2);
+            let reply =
+                execute_one_call(Arc::clone(&fs), readdir_call(1, true, dircount, maxcount)).await;
+            assert_eq!(
+                nfs_status(&reply),
+                nfsstat3::NFS3ERR_TOOSMALL as u32,
+                "dircount {dircount}, maxcount {maxcount}"
+            );
         }
+
+        let fs = Arc::new(BlockingWriteFs::new());
+        let one = execute_one_call(Arc::clone(&fs), readdir_call(1, true, 36, 244)).await;
+        assert_eq!(one.len(), 272);
+        assert_eq!(
+            parse_directory_reply(&one, true),
+            ParsedDirectoryReply {
+                names: vec![b".".to_vec()],
+                eof: false,
+            }
+        );
+
+        let two = execute_one_call(fs, readdir_call(2, true, 64, 384)).await;
+        assert_eq!(two.len(), 412);
+        assert_eq!(
+            parse_directory_reply(&two, true),
+            ParsedDirectoryReply {
+                names: vec![b".".to_vec(), b"..".to_vec()],
+                eof: true,
+            }
+        );
     }
 }

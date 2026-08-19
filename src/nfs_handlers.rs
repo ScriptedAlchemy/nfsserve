@@ -16,9 +16,40 @@ use std::io::{Read, Write};
 use tracing::{debug, error, trace, warn};
 
 const MAX_NFS_IO_BYTES: u32 = 1024 * 1024;
-const READDIR_REPLY_OVERHEAD: usize = 128;
-// An initial directory page must be able to advance past both `.` and `..`.
-const MIN_READDIR_ENTRIES: usize = 2;
+// XDR list tail: a false next-entry discriminator followed by the EOF bool.
+const DIRECTORY_LIST_TAIL_BYTES: usize = 8;
+// Minimum XDR entry: true discriminator + fileid + empty opaque name + cookie.
+const MIN_READDIR_ENTRY_BYTES: usize = 24;
+// READDIRPLUS always emits a present fattr3 and file handle. This minimum uses
+// an empty name and empty handle body; concrete handles only increase it.
+const MIN_READDIRPLUS_ENTRY_BYTES: usize = 120;
+
+fn fits_with_tail(current: usize, added: usize, limit: usize) -> bool {
+    current
+        .checked_add(added)
+        .and_then(|bytes| bytes.checked_add(DIRECTORY_LIST_TAIL_BYTES))
+        .is_some_and(|bytes| bytes <= limit)
+}
+
+fn entry_capacity(limit: usize, fixed: usize, minimum_entry: usize) -> usize {
+    fixed
+        .checked_add(DIRECTORY_LIST_TAIL_BYTES)
+        .and_then(|used| limit.checked_sub(used))
+        .map(|bytes| bytes / minimum_entry)
+        .unwrap_or(0)
+}
+
+fn write_readdir_error(
+    xid: u32,
+    status: nfs::nfsstat3,
+    dir_attr: nfs::post_op_attr,
+    output: &mut impl Write,
+) -> Result<(), anyhow::Error> {
+    make_success_reply(xid).serialize(output)?;
+    status.serialize(output)?;
+    dir_attr.serialize(output)?;
+    Ok(())
+}
 
 /// Helper function to create AuthContext from RPCContext
 fn auth_from_context(context: &RPCContext) -> AuthContext {
@@ -918,112 +949,97 @@ pub async fn nfsproc3_readdirplus(
         dir_attr.serialize(output)?;
         return Ok(());
     }*/
-    // Reserve fixed reply framing and cap client-controlled counts to the
-    // transport's maximum reply record before asking the filesystem for data.
-    let max_reply_bytes = (args.maxcount as usize).min(MAX_RPC_RECORD_BYTES);
-    let Some(max_bytes_allowed) = max_reply_bytes
-        .checked_sub(READDIR_REPLY_OVERHEAD)
-        .filter(|bytes| *bytes > 0)
-    else {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
-        return Ok(());
-    };
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let max_dircount_bytes = (args.dircount as usize).min(max_bytes_allowed);
-    let estimated_max_results = max_dircount_bytes / 16;
-    if estimated_max_results < MIN_READDIR_ENTRIES {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
+    let result_limit = args.maxcount as usize;
+    let dir_limit = args.dircount as usize;
+    let mut reply = Vec::new();
+    make_success_reply(xid).serialize(&mut reply)?;
+    nfs::nfsstat3::NFS3_OK.serialize(&mut reply)?;
+    let result_start = reply.len();
+    dir_attr.serialize(&mut reply)?;
+    dirversion.serialize(&mut reply)?;
+
+    let result_capacity = entry_capacity(
+        result_limit,
+        reply.len() - result_start,
+        MIN_READDIRPLUS_ENTRY_BYTES,
+    );
+    let wire_capacity = entry_capacity(
+        MAX_RPC_RECORD_BYTES,
+        reply.len(),
+        MIN_READDIRPLUS_ENTRY_BYTES,
+    );
+    let dir_capacity = entry_capacity(dir_limit, 0, MIN_READDIR_ENTRY_BYTES);
+    let max_results = result_capacity.min(wire_capacity).min(dir_capacity);
+    if max_results == 0 {
+        write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
         return Ok(());
     }
     let mut ctr = 0;
     match context
         .vfs
-        .readdir(
-            &auth_from_context(context),
-            dirid,
-            args.cookie,
-            estimated_max_results,
-        )
+        .readdir(&auth_from_context(context), dirid, args.cookie, max_results)
         .await
     {
         Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
+            let entry_count = result.entries.len();
+            if entry_count == 0 && !result.end {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_SERVERFAULT, dir_attr, output)?;
+                return Ok(());
+            }
+            let mut accumulated_dircount = 0usize;
             for entry in result.entries {
                 let obj_attr = entry.attr;
                 let display_fileid = obj_attr.fileid;
                 let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
-
-                let entry = entryplus3 {
+                let dir_entry = entry3 {
+                    fileid: display_fileid,
+                    name: entry.name.clone(),
+                    cookie: entry.cookie,
+                };
+                let plus_entry = entryplus3 {
                     fileid: display_fileid,
                     name: entry.name,
                     cookie: entry.cookie,
                     name_attributes: nfs::post_op_attr::attributes(obj_attr),
                     name_handle: handle,
                 };
-                // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if counting_output
-                    .bytes_written()
-                    .checked_add(added_output_bytes)
-                    .is_some_and(|bytes| bytes <= max_bytes_allowed)
-                    && accumulated_dircount
-                        .checked_add(added_dircount)
-                        .is_some_and(|bytes| bytes <= max_dircount_bytes)
+                let mut dir_bytes = Vec::new();
+                true.serialize(&mut dir_bytes)?;
+                dir_entry.serialize(&mut dir_bytes)?;
+                let mut plus_bytes = Vec::new();
+                true.serialize(&mut plus_bytes)?;
+                plus_entry.serialize(&mut plus_bytes)?;
+
+                if fits_with_tail(reply.len() - result_start, plus_bytes.len(), result_limit)
+                    && fits_with_tail(reply.len(), plus_bytes.len(), MAX_RPC_RECORD_BYTES)
+                    && fits_with_tail(accumulated_dircount, dir_bytes.len(), dir_limit)
                 {
-                    trace!("  -- dirent {:?}", entry);
-                    // commit the entry
+                    trace!("  -- dirent {:?}", plus_entry);
                     ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
+                    reply.extend_from_slice(&plus_bytes);
+                    accumulated_dircount += dir_bytes.len();
                     trace!(
                         "  -- lengths: {:?} / {:?} {:?} / {:?}",
                         accumulated_dircount,
-                        max_dircount_bytes,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
+                        dir_limit,
+                        reply.len(),
+                        result_limit
                     );
                 } else {
                     trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
                     break;
                 }
             }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
+            if ctr == 0 && entry_count > 0 {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+                return Ok(());
             }
+            let all_entries_written = ctr == entry_count;
+            false.serialize(&mut reply)?;
+            let eof = all_entries_written && result.end;
+            eof.serialize(&mut reply)?;
+            debug!("  -- readdir eof {:?}", eof);
+            output.write_all(&reply)?;
             debug!(
                 "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
                 dirid, has_version, args.cookie, ctr, all_entries_written
@@ -1031,9 +1047,7 @@ pub async fn nfsproc3_readdirplus(
         }
         Err(stat) => {
             error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
+            write_readdir_error(xid, stat, dir_attr, output)?;
         }
     };
     Ok(())
@@ -1077,51 +1091,36 @@ pub async fn nfsproc3_readdir(
     debug!(" -- Dir attr {:?}", dir_attr);
     debug!(" -- Dir version {:?}", dirversion);
     let has_version = args.cookieverf != nfs::cookieverf3::default();
-    // Reserve fixed reply framing and cap the client-controlled count before
-    // using it to size the filesystem query or output.
-    let max_reply_bytes = (args.dircount as usize).min(MAX_RPC_RECORD_BYTES);
-    let Some(max_bytes_allowed) = max_reply_bytes
-        .checked_sub(READDIR_REPLY_OVERHEAD)
-        .filter(|bytes| *bytes > 0)
-    else {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
-        return Ok(());
-    };
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = max_bytes_allowed / 16;
-    if estimated_max_results < MIN_READDIR_ENTRIES {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
+    let result_limit = args.dircount as usize;
+    let mut reply = Vec::new();
+    make_success_reply(xid).serialize(&mut reply)?;
+    nfs::nfsstat3::NFS3_OK.serialize(&mut reply)?;
+    let result_start = reply.len();
+    dir_attr.serialize(&mut reply)?;
+    dirversion.serialize(&mut reply)?;
+    let result_capacity = entry_capacity(
+        result_limit,
+        reply.len() - result_start,
+        MIN_READDIR_ENTRY_BYTES,
+    );
+    let wire_capacity = entry_capacity(MAX_RPC_RECORD_BYTES, reply.len(), MIN_READDIR_ENTRY_BYTES);
+    let max_results = result_capacity.min(wire_capacity);
+    if max_results == 0 {
+        write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
         return Ok(());
     }
     let mut ctr = 0;
     match context
         .vfs
-        .readdir(
-            &auth_from_context(context),
-            dirid,
-            args.cookie,
-            estimated_max_results,
-        )
+        .readdir(&auth_from_context(context), dirid, args.cookie, max_results)
         .await
     {
         Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
+            let entry_count = result.entries.len();
+            if entry_count == 0 && !result.end {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_SERVERFAULT, dir_attr, output)?;
+                return Ok(());
+            }
             for entry in result.entries {
                 let entry = entry3 {
                     fileid: entry.fileid,
@@ -1129,49 +1128,31 @@ pub async fn nfsproc3_readdir(
                     cookie: entry.cookie,
                 };
                 // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if counting_output
-                    .bytes_written()
-                    .checked_add(added_output_bytes)
-                    .is_some_and(|bytes| bytes <= max_bytes_allowed)
+                let mut entry_bytes = Vec::new();
+                true.serialize(&mut entry_bytes)?;
+                entry.serialize(&mut entry_bytes)?;
+                if fits_with_tail(reply.len() - result_start, entry_bytes.len(), result_limit)
+                    && fits_with_tail(reply.len(), entry_bytes.len(), MAX_RPC_RECORD_BYTES)
                 {
                     trace!("  -- dirent {:?}", entry);
-                    // commit the entry
                     ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
-                    trace!(
-                        "  -- lengths: {:?} / {:?} / {:?}",
-                        accumulated_dircount,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
-                    );
+                    reply.extend_from_slice(&entry_bytes);
+                    trace!("  -- length: {:?} / {:?}", reply.len(), result_limit);
                 } else {
                     trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
                     break;
                 }
             }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
+            if ctr == 0 && entry_count > 0 {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+                return Ok(());
             }
+            let all_entries_written = ctr == entry_count;
+            false.serialize(&mut reply)?;
+            let eof = all_entries_written && result.end;
+            eof.serialize(&mut reply)?;
+            debug!("  -- readdir eof {:?}", eof);
+            output.write_all(&reply)?;
             debug!(
                 "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
                 dirid, has_version, args.cookie, ctr, all_entries_written
@@ -1179,9 +1160,7 @@ pub async fn nfsproc3_readdir(
         }
         Err(stat) => {
             error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
+            write_readdir_error(xid, stat, dir_attr, output)?;
         }
     };
     Ok(())

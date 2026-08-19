@@ -15,7 +15,6 @@ use crate::nfs_handlers;
 
 use crate::portmap;
 use crate::portmap_handlers;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 // Information from RFC 5531
 // https://datatracker.ietf.org/doc/html/rfc5531
@@ -92,19 +91,4 @@ pub(crate) async fn handle_rpc(
         error!("Unexpectedly received a Reply instead of a Call");
         Err(anyhow!("Bad RPC Call format"))
     }
-}
-
-pub async fn write_fragment<W: AsyncWrite + Unpin>(
-    socket: &mut W,
-    buf: &[u8],
-) -> Result<(), anyhow::Error> {
-    // TODO: split into many fragments
-    assert!(buf.len() < (1 << 31));
-    // set the last flag
-    let fragment_header = buf.len() as u32 + (1 << 31);
-    let header_buf = u32::to_be_bytes(fragment_header);
-    socket.write_all(&header_buf).await?;
-    trace!("Writing fragment length:{}", buf.len());
-    socket.write_all(buf).await?;
-    Ok(())
 }

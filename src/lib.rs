@@ -3,7 +3,6 @@
 mod context;
 mod rpc;
 mod rpcwire;
-mod write_counter;
 pub mod xdr;
 
 mod mount;

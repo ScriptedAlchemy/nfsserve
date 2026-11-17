@@ -684,7 +684,7 @@ pub async fn nfsproc3_pathconf(
         name_max: 32768,
         no_trunc: true,
         chown_restricted: true,
-        case_insensitive: false,
+        case_insensitive: context.vfs.case_insensitive(),
         case_preserving: true,
     };
     debug!(" {:?} ---> {:?}", xid, res);

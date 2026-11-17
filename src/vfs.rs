@@ -159,6 +159,10 @@ pub struct CommitResult {
 pub trait NFSFileSystem: Sync {
     /// Returns the set of capabilities supported
     fn capabilities(&self) -> VFSCapabilities;
+    /// Whether filename lookup ignores case on this filesystem (NFSv3 PATHCONF).
+    fn case_insensitive(&self) -> bool {
+        false
+    }
     /// Returns the ID the of the root directory "/"
     fn root_dir(&self) -> fileid3;
     /// Look up the id of a path in a directory

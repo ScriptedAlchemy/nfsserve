@@ -1,7 +1,18 @@
 Rust NFSv3 Server
 =================
-This is an incomplete but very functional implementation of an NFSv3 server
-in Rust.
+This fork provides the `zerofs_nfsserve` crate used by ZeroFS. Its `main` branch integrates
+[huggingface/nfsserve](https://github.com/huggingface/nfsserve) with the ZeroFS
+filesystem API, bounded RPC transport, and write replay support.
+
+```toml
+[dependencies]
+zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", branch = "main" }
+```
+
+License
+-------
+The upstream code retains its [BSD 3-Clause license and copyright notices](LICENSE).
+The ZeroFS fork modifications carry the [GNU Affero General Public License v3.0](LICENSE-MODIFICATIONS).
 
 Why? You may ask. 
 
@@ -20,7 +31,7 @@ a lot of the work myself.
 So, this is a FUSE-like user-mode filesystem API that basically works by 
 creating a localhost NFSv3 server you can mount.
 
-This is used in [hf-mount](https://github.com/huggingface/hf-mount) to provide the `hf-mount`
+The upstream crate is used in [hf-mount](https://github.com/huggingface/hf-mount) to provide the `hf-mount`
 functionality.
 
 Run the Demo
@@ -53,9 +64,17 @@ Note that the demo filesystem is *writable*.
 Usage
 =====
 
+Version 0.20 removes the public `rpcwire::SocketMessageHandler` compatibility
+surface. It could bypass transport admission and queue RPC tasks without a
+memory bound. Integrations should use `tcp::NFSTcpListener`, whose connection
+lifecycle and request/reply budgets are managed by the server.
+
+The TCP listener admits at most 64 active connections. RPC record assembly and
+reply transmission each have a 30-second no-progress deadline and a 120-second
+total deadline, so stalled or drip-fed peers cannot retain admission forever.
+
 You simply need to implement the vfs::NFSFileSystem
-trait. See demofs.rs for an example and bin/main.rs for how to actually start
-a service. The interface generally not difficult to implement; demanding mainly
+trait. See [examples/demo.rs](examples/demo.rs) for a filesystem implementation and TCP listener. The interface generally not difficult to implement; demanding mainly
 the ability to associate every file system object (directory/file) with a 64-bit
 ID. Directory listing can be a bit complicated due to the pagination requirements.
 

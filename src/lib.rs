@@ -3,7 +3,6 @@
 mod context;
 mod rpc;
 mod rpcwire;
-mod write_counter;
 pub mod xdr;
 
 mod mount;
@@ -21,3 +20,5 @@ pub mod fs_util;
 pub mod tcp;
 mod transaction_tracker;
 pub mod vfs;
+
+pub use crate::{xdr_bool_union as XDRBoolUnion, xdr_enum_serde as XDREnumSerde, xdr_struct as XDRStruct};

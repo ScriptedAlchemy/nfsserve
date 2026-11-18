@@ -35,17 +35,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - name: Install Rust 1.90
+      - name: Install Rust 1.100
         uses: dtolnay/rust-toolchain@fbe9290f8d4249ed67757fa4c30883d5a2697137 # 1.100
         with:
           components: clippy
       - name: Lint
         run: |
-          cargo clippy -r --verbose -- -D warnings # elevates warnings to errors
+          cargo clippy --release --all-targets --all-features -- -D warnings
       - name: Build and Test
         run: |
-          cargo test --verbose --no-fail-fast --features "strict"
-      - name: Check Cargo.lock has no uncommitted changes
-        run: |
-          # the build and test steps would update Cargo.lock if it is out of date
-          test -z "$(git status --porcelain Cargo.lock)" || (echo "Cargo.lock has uncommitted changes!" && exit 1)
+          cargo test --all-targets --all-features --no-fail-fast

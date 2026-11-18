@@ -102,11 +102,11 @@ xdr_enum_serde!(auth_flavor);
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 pub struct auth_unix {
-    stamp: u32,
-    machinename: Vec<u8>,
-    uid: u32,
-    gid: u32,
-    gids: Vec<u32>,
+    pub stamp: u32,
+    pub machinename: Vec<u8>,
+    pub uid: u32,
+    pub gid: u32,
+    pub gids: Vec<u32>,
 }
 xdr_struct!(auth_unix, stamp, machinename, uid, gid, gids);
 

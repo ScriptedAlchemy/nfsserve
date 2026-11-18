@@ -9,9 +9,53 @@ use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
 use crate::nfs;
+use crate::nfs::stable_how;
 use crate::rpc::*;
-use crate::vfs::VFSCapabilities;
+use crate::tcp::MAX_RPC_RECORD_BYTES;
+use crate::vfs::{AuthContext, CommitRequestContext, RpcRequestContext, VFSCapabilities, WriteRequestContext};
 use crate::xdr::*;
+
+const MAX_NFS_IO_BYTES: u32 = 1024 * 1024;
+// XDR list tail: a false next-entry discriminator followed by the EOF bool.
+const DIRECTORY_LIST_TAIL_BYTES: usize = 8;
+// Minimum XDR entry: true discriminator + fileid + empty opaque name + cookie.
+const MIN_READDIR_ENTRY_BYTES: usize = 24;
+// READDIRPLUS always emits a present fattr3 and file handle. This minimum uses
+// an empty name and empty handle body; concrete handles only increase it.
+const MIN_READDIRPLUS_ENTRY_BYTES: usize = 120;
+
+fn fits_with_tail(current: usize, added: usize, limit: usize) -> bool {
+    current
+        .checked_add(added)
+        .and_then(|bytes| bytes.checked_add(DIRECTORY_LIST_TAIL_BYTES))
+        .is_some_and(|bytes| bytes <= limit)
+}
+
+fn entry_capacity(limit: usize, fixed: usize, minimum_entry: usize) -> usize {
+    fixed
+        .checked_add(DIRECTORY_LIST_TAIL_BYTES)
+        .and_then(|used| limit.checked_sub(used))
+        .map(|bytes| bytes / minimum_entry)
+        .unwrap_or(0)
+}
+
+fn write_readdir_error(
+    xid: u32,
+    status: nfs::nfsstat3,
+    dir_attr: nfs::post_op_attr,
+    output: &mut impl Write,
+) -> Result<(), anyhow::Error> {
+    make_success_reply(xid).serialize(output)?;
+    status.serialize(output)?;
+    dir_attr.serialize(output)?;
+    Ok(())
+}
+
+/// Helper function to create AuthContext from RPCContext
+fn auth_from_context(context: &RPCContext) -> AuthContext {
+    AuthContext::from_rpc_auth(&context.auth)
+}
+
 /*
 program NFS_PROGRAM {
  version NFS_V3 {
@@ -121,6 +165,7 @@ pub async fn handle_nfs(
     input: &mut impl Read,
     output: &mut impl Write,
     context: &RPCContext,
+    connection_incarnation: u64,
 ) -> Result<(), anyhow::Error> {
     if call.vers != nfs::VERSION {
         warn!("Invalid NFS Version number {} != {}", call.vers, nfs::VERSION);
@@ -140,7 +185,7 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_FSSTAT => nfsproc3_fsstat(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_READDIR => nfsproc3_readdir(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_READDIRPLUS => nfsproc3_readdirplus(xid, input, output, context).await?,
-        NFSProgram::NFSPROC3_WRITE => nfsproc3_write(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_WRITE => nfsproc3_write(xid, input, output, context, connection_incarnation).await?,
         NFSProgram::NFSPROC3_CREATE => nfsproc3_create(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_SETATTR => nfsproc3_setattr(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context).await?,
@@ -149,14 +194,13 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_MKDIR => nfsproc3_mkdir(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_SYMLINK => nfsproc3_symlink(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_READLINK => nfsproc3_readlink(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_MKNOD => nfsproc3_mknod(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_LINK => nfsproc3_link(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_COMMIT => nfsproc3_commit(xid, input, output, context, connection_incarnation).await?,
         _ => {
             warn!("Unimplemented message {:?}", prog);
             proc_unavail_reply_message(xid).serialize(output)?;
-        }, /*
-           NFSPROC3_MKNOD,
-           NFSPROC3_LINK,
-           NFSPROC3_COMMIT,
-           INVALID*/
+        },
     }
     Ok(())
 }
@@ -203,7 +247,7 @@ pub async fn nfsproc3_getattr(
         return Ok(());
     }
     let id = id.unwrap();
-    match context.vfs.getattr(id).await {
+    match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(fh) => {
             debug!(" {:?} --> {:?}", xid, fh);
             make_success_reply(xid).serialize(output)?;
@@ -264,13 +308,13 @@ pub async fn nfsproc3_lookup(
     }
     let dirid = dirid.unwrap();
 
-    let dir_attr = match context.vfs.getattr(dirid).await {
+    let dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
-    match context.vfs.lookup(dirid, &dirops.name).await {
+    match context.vfs.lookup(&auth_from_context(context), dirid, &dirops.name).await {
         Ok(fid) => {
-            let obj_attr = match context.vfs.getattr(fid).await {
+            let obj_attr = match context.vfs.getattr(&auth_from_context(context), fid).await {
                 Ok(v) => nfs::post_op_attr::attributes(v),
                 Err(_) => nfs::post_op_attr::Void,
             };
@@ -346,6 +390,12 @@ pub async fn nfsproc3_read(
     let mut args = READ3args::default();
     args.deserialize(input)?;
     debug!("nfsproc3_read({:?},{:?}) ", xid, args);
+    if args.count > MAX_NFS_IO_BYTES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_INVAL.serialize(output)?;
+        nfs::post_op_attr::Void.serialize(output)?;
+        return Ok(());
+    }
 
     let id = context.vfs.fh_to_id(&args.file);
     if let Err(stat) = id {
@@ -356,11 +406,11 @@ pub async fn nfsproc3_read(
     }
     let id = id.unwrap();
 
-    let obj_attr = match context.vfs.getattr(id).await {
+    let obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
-    match context.vfs.read(id, args.offset, args.count).await {
+    match context.vfs.read(&auth_from_context(context), id, args.offset, args.count).await {
         Ok((bytes, eof)) => {
             let res = READ3resok {
                 file_attributes: obj_attr,
@@ -441,7 +491,7 @@ pub async fn nfsproc3_fsinfo(
     }
     let id = id.unwrap();
 
-    match context.vfs.fsinfo(id).await {
+    match context.vfs.fsinfo(&auth_from_context(context), id).await {
         Ok(fsinfo) => {
             debug!(" {:?} --> {:?}", xid, fsinfo);
             make_success_reply(xid).serialize(output)?;
@@ -512,7 +562,7 @@ pub async fn nfsproc3_access(
     }
     let id = id.unwrap();
 
-    let obj_attr = match context.vfs.getattr(id).await {
+    let obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -588,49 +638,36 @@ pub async fn nfsproc3_pathconf(
     handle.deserialize(input)?;
     debug!("nfsproc3_pathconf({:?},{:?})", xid, handle);
 
-    let id = context.vfs.fh_to_id(&handle);
-    // fail if unable to convert file handle
-    if let Err(stat) = id {
-        make_success_reply(xid).serialize(output)?;
-        stat.serialize(output)?;
-        nfs::post_op_attr::Void.serialize(output)?;
-        return Ok(());
-    }
-    let id = id.unwrap();
-
-    let obj_attr = match context.vfs.getattr(id).await {
-        Ok(v) => nfs::post_op_attr::attributes(v),
-        Err(_) => nfs::post_op_attr::Void,
+    let attributes = match context.vfs.fh_to_id(&handle) {
+        Ok(id) => context.vfs.getattr(&auth_from_context(context), id).await,
+        Err(status) => Err(status),
     };
+    make_success_reply(xid).serialize(output)?;
+    let attributes = match attributes {
+        Ok(attributes) => attributes,
+        Err(status) => {
+            status.serialize(output)?;
+            nfs::post_op_attr::Void.serialize(output)?;
+            return Ok(());
+        },
+    };
+
     let res = PATHCONF3resok {
-        obj_attributes: obj_attr,
+        obj_attributes: nfs::post_op_attr::attributes(attributes),
         linkmax: 0,
-        name_max: 32768,
+        name_max: context.vfs.name_max(),
         no_trunc: true,
         chown_restricted: true,
-        case_insensitive: false,
+        case_insensitive: context.vfs.case_insensitive(),
         case_preserving: true,
     };
     debug!(" {:?} ---> {:?}", xid, res);
-    make_success_reply(xid).serialize(output)?;
     nfs::nfsstat3::NFS3_OK.serialize(output)?;
     res.serialize(output)?;
     Ok(())
 }
 
-#[allow(non_camel_case_types)]
-#[derive(Debug, Default)]
-struct FSSTAT3resok {
-    obj_attributes: nfs::post_op_attr,
-    tbytes: nfs::size3,
-    fbytes: nfs::size3,
-    abytes: nfs::size3,
-    tfiles: nfs::size3,
-    ffiles: nfs::size3,
-    afiles: nfs::size3,
-    invarsec: u32,
-}
-xdr_struct!(FSSTAT3resok, obj_attributes, tbytes, fbytes, abytes, tfiles, ffiles, afiles, invarsec);
+// FSSTAT3resok is now defined as nfs::fsstat3 in the nfs module
 
 /*
  FSSTAT3res NFSPROC3_FSSTAT(FSSTAT3args) = 18;
@@ -682,24 +719,24 @@ pub async fn nfsproc3_fsstat(
     }
     let id = id.unwrap();
 
-    let obj_attr = match context.vfs.getattr(id).await {
-        Ok(v) => nfs::post_op_attr::attributes(v),
-        Err(_) => nfs::post_op_attr::Void,
-    };
-    let res = FSSTAT3resok {
-        obj_attributes: obj_attr,
-        tbytes: 1024 * 1024 * 1024 * 1024,
-        fbytes: 1024 * 1024 * 1024 * 1024,
-        abytes: 1024 * 1024 * 1024 * 1024,
-        tfiles: 1024 * 1024 * 1024,
-        ffiles: 1024 * 1024 * 1024,
-        afiles: 1024 * 1024 * 1024,
-        invarsec: u32::MAX,
-    };
-    make_success_reply(xid).serialize(output)?;
-    nfs::nfsstat3::NFS3_OK.serialize(output)?;
-    debug!(" {:?} ---> {:?}", xid, res);
-    res.serialize(output)?;
+    match context.vfs.fsstat(&auth_from_context(context), id).await {
+        Ok(res) => {
+            make_success_reply(xid).serialize(output)?;
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            debug!(" {:?} ---> {:?}", xid, res);
+            res.serialize(output)?;
+        },
+        Err(stat) => {
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            // FSSTAT3resfail - just post_op_attr
+            let obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
+                Ok(v) => nfs::post_op_attr::attributes(v),
+                Err(_) => nfs::post_op_attr::Void,
+            };
+            obj_attr.serialize(output)?;
+        },
+    }
     Ok(())
 }
 
@@ -789,7 +826,7 @@ pub async fn nfsproc3_readdirplus(
         return Ok(());
     }
     let dirid = dirid.unwrap();
-    let dir_attr_maybe = context.vfs.getattr(dirid).await;
+    let dir_attr_maybe = context.vfs.getattr(&auth_from_context(context), dirid).await;
 
     let dir_attr = match dir_attr_maybe {
         Ok(v) => nfs::post_op_attr::attributes(v),
@@ -865,81 +902,89 @@ pub async fn nfsproc3_readdirplus(
         dir_attr.serialize(output)?;
         return Ok(());
     }*/
-    // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.maxcount as usize - 128;
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
-    let max_dircount_bytes = args.dircount as usize;
+    let result_limit = args.maxcount as usize;
+    let dir_limit = args.dircount as usize;
+    let mut reply = Vec::new();
+    make_success_reply(xid).serialize(&mut reply)?;
+    nfs::nfsstat3::NFS3_OK.serialize(&mut reply)?;
+    let result_start = reply.len();
+    dir_attr.serialize(&mut reply)?;
+    dirversion.serialize(&mut reply)?;
+
+    let result_capacity = entry_capacity(result_limit, reply.len() - result_start, MIN_READDIRPLUS_ENTRY_BYTES);
+    let wire_capacity = entry_capacity(MAX_RPC_RECORD_BYTES, reply.len(), MIN_READDIRPLUS_ENTRY_BYTES);
+    let dir_capacity = entry_capacity(dir_limit, 0, MIN_READDIR_ENTRY_BYTES);
+    let max_results = result_capacity.min(wire_capacity).min(dir_capacity);
+    if max_results == 0 {
+        write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+        return Ok(());
+    }
     let mut ctr = 0;
-    match context.vfs.readdir(dirid, args.cookie, estimated_max_results as usize).await {
+    match context
+        .vfs
+        .readdir(&auth_from_context(context), dirid, args.cookie, max_results)
+        .await
+    {
         Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
+            let entry_count = result.entries.len();
+            if entry_count == 0 && !result.end {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_SERVERFAULT, dir_attr, output)?;
+                return Ok(());
+            }
+            let mut accumulated_dircount = 0usize;
             for entry in result.entries {
                 let obj_attr = entry.attr;
+                let display_fileid = obj_attr.fileid;
                 let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
-
-                let entry = entryplus3 {
-                    fileid: entry.fileid,
+                let dir_entry = entry3 {
+                    fileid: display_fileid,
+                    name: entry.name.clone(),
+                    cookie: entry.cookie,
+                };
+                let plus_entry = entryplus3 {
+                    fileid: display_fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                     name_attributes: nfs::post_op_attr::attributes(obj_attr),
                     name_handle: handle,
                 };
-                // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed
-                    && added_dircount + accumulated_dircount < max_dircount_bytes
+                let mut dir_bytes = Vec::new();
+                true.serialize(&mut dir_bytes)?;
+                dir_entry.serialize(&mut dir_bytes)?;
+                let mut plus_bytes = Vec::new();
+                true.serialize(&mut plus_bytes)?;
+                plus_entry.serialize(&mut plus_bytes)?;
+
+                if fits_with_tail(reply.len() - result_start, plus_bytes.len(), result_limit)
+                    && fits_with_tail(reply.len(), plus_bytes.len(), MAX_RPC_RECORD_BYTES)
+                    && fits_with_tail(accumulated_dircount, dir_bytes.len(), dir_limit)
                 {
-                    trace!("  -- dirent {:?}", entry);
-                    // commit the entry
+                    trace!("  -- dirent {:?}", plus_entry);
                     ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
+                    reply.extend_from_slice(&plus_bytes);
+                    accumulated_dircount += dir_bytes.len();
                     trace!(
                         "  -- lengths: {:?} / {:?} {:?} / {:?}",
                         accumulated_dircount,
-                        max_dircount_bytes,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
+                        dir_limit,
+                        reply.len(),
+                        result_limit
                     );
                 } else {
                     trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
                     break;
                 }
             }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
+            if ctr == 0 && entry_count > 0 {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+                return Ok(());
             }
+            let all_entries_written = ctr == entry_count;
+            false.serialize(&mut reply)?;
+            let eof = all_entries_written && result.end;
+            eof.serialize(&mut reply)?;
+            debug!("  -- readdir eof {:?}", eof);
+            output.write_all(&reply)?;
             debug!(
                 "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
                 dirid, has_version, args.cookie, ctr, all_entries_written
@@ -947,9 +992,7 @@ pub async fn nfsproc3_readdirplus(
         },
         Err(stat) => {
             error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
+            write_readdir_error(xid, stat, dir_attr, output)?;
         },
     };
     Ok(())
@@ -974,7 +1017,7 @@ pub async fn nfsproc3_readdir(
         return Ok(());
     }
     let dirid = dirid.unwrap();
-    let dir_attr_maybe = context.vfs.getattr(dirid).await;
+    let dir_attr_maybe = context.vfs.getattr(&auth_from_context(context), dirid).await;
 
     let dir_attr = match dir_attr_maybe {
         Ok(v) => nfs::post_op_attr::attributes(v),
@@ -990,72 +1033,64 @@ pub async fn nfsproc3_readdir(
     debug!(" -- Dir attr {:?}", dir_attr);
     debug!(" -- Dir version {:?}", dirversion);
     let has_version = args.cookieverf != nfs::cookieverf3::default();
-    // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.dircount as usize - 128;
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
+    let result_limit = args.dircount as usize;
+    let mut reply = Vec::new();
+    make_success_reply(xid).serialize(&mut reply)?;
+    nfs::nfsstat3::NFS3_OK.serialize(&mut reply)?;
+    let result_start = reply.len();
+    dir_attr.serialize(&mut reply)?;
+    dirversion.serialize(&mut reply)?;
+    let result_capacity = entry_capacity(result_limit, reply.len() - result_start, MIN_READDIR_ENTRY_BYTES);
+    let wire_capacity = entry_capacity(MAX_RPC_RECORD_BYTES, reply.len(), MIN_READDIR_ENTRY_BYTES);
+    let max_results = result_capacity.min(wire_capacity);
+    if max_results == 0 {
+        write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+        return Ok(());
+    }
     let mut ctr = 0;
-    match context.vfs.readdir_simple(dirid, estimated_max_results as usize).await {
+    match context
+        .vfs
+        .readdir(&auth_from_context(context), dirid, args.cookie, max_results)
+        .await
+    {
         Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
+            let entry_count = result.entries.len();
+            if entry_count == 0 && !result.end {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_SERVERFAULT, dir_attr, output)?;
+                return Ok(());
+            }
             for entry in result.entries {
                 let entry = entry3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                 };
                 // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed {
+                let mut entry_bytes = Vec::new();
+                true.serialize(&mut entry_bytes)?;
+                entry.serialize(&mut entry_bytes)?;
+                if fits_with_tail(reply.len() - result_start, entry_bytes.len(), result_limit)
+                    && fits_with_tail(reply.len(), entry_bytes.len(), MAX_RPC_RECORD_BYTES)
+                {
                     trace!("  -- dirent {:?}", entry);
-                    // commit the entry
                     ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
-                    trace!(
-                        "  -- lengths: {:?} / {:?} / {:?}",
-                        accumulated_dircount,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
-                    );
+                    reply.extend_from_slice(&entry_bytes);
+                    trace!("  -- length: {:?} / {:?}", reply.len(), result_limit);
                 } else {
                     trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
                     break;
                 }
             }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
+            if ctr == 0 && entry_count > 0 {
+                write_readdir_error(xid, nfs::nfsstat3::NFS3ERR_TOOSMALL, dir_attr, output)?;
+                return Ok(());
             }
+            let all_entries_written = ctr == entry_count;
+            false.serialize(&mut reply)?;
+            let eof = all_entries_written && result.end;
+            eof.serialize(&mut reply)?;
+            debug!("  -- readdir eof {:?}", eof);
+            output.write_all(&reply)?;
             debug!(
                 "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
                 dirid, has_version, args.cookie, ctr, all_entries_written
@@ -1063,24 +1098,11 @@ pub async fn nfsproc3_readdir(
         },
         Err(stat) => {
             error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
+            write_readdir_error(xid, stat, dir_attr, output)?;
         },
     };
     Ok(())
 }
-
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
-#[repr(u32)]
-pub enum stable_how {
-    #[default]
-    UNSTABLE = 0,
-    DATA_SYNC = 1,
-    FILE_SYNC = 2,
-}
-xdr_enum_serde!(stable_how);
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Default)]
@@ -1144,6 +1166,7 @@ pub async fn nfsproc3_write(
     input: &mut impl Read,
     output: &mut impl Write,
     context: &RPCContext,
+    connection_incarnation: u64,
 ) -> Result<(), anyhow::Error> {
     // if we do not have write capabilities
     if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
@@ -1158,8 +1181,154 @@ pub async fn nfsproc3_write(
     args.deserialize(input)?;
     debug!("nfsproc3_write({:?},...) ", xid);
     // sanity check the length
+    if args.count > MAX_NFS_IO_BYTES {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_INVAL.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        return Ok(());
+    }
     if args.data.len() != args.count as usize {
         garbage_args_reply_message(xid).serialize(output)?;
+        return Ok(());
+    }
+    // sanity check the requested stability level
+    let requested_stability = match stable_how::from_u32(args.stable) {
+        Some(stability) => stability,
+        None => {
+            garbage_args_reply_message(xid).serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    let id = context.vfs.fh_to_id(&args.file);
+    if let Err(stat) = id {
+        make_success_reply(xid).serialize(output)?;
+        stat.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        return Ok(());
+    }
+    let id = id.unwrap();
+
+    // get the object attributes before the write
+    let pre_obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
+        Ok(v) => {
+            let wccattr = nfs::wcc_attr {
+                size: v.size,
+                mtime: v.mtime,
+                ctime: v.ctime,
+            };
+            nfs::pre_op_attr::attributes(wccattr)
+        },
+        Err(_) => nfs::pre_op_attr::Void,
+    };
+
+    let write_context = WriteRequestContext {
+        rpc: RpcRequestContext {
+            xid,
+            client_addr: context.client_addr.clone(),
+            connection_incarnation,
+        },
+        requested_stability,
+    };
+
+    match context
+        .vfs
+        .write_with_context(&write_context, &auth_from_context(context), id, args.offset, &args.data)
+        .await
+    {
+        Ok(result) => {
+            debug!("write success {:?} --> {:?}", xid, result.attributes);
+            let res = WRITE3resok {
+                file_wcc: nfs::wcc_data {
+                    before: pre_obj_attr,
+                    after: nfs::post_op_attr::attributes(result.attributes),
+                },
+                count: args.count,
+                committed: result.committed,
+                verf: result.verifier,
+            };
+            make_success_reply(xid).serialize(output)?;
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            res.serialize(output)?;
+        },
+        Err(stat) => {
+            error!("write error {:?} --> {:?}", xid, stat);
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs::wcc_data::default().serialize(output)?;
+        },
+    }
+    Ok(())
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3args {
+    file: nfs::nfs_fh3,
+    offset: nfs::offset3,
+    count: nfs::count3,
+}
+xdr_struct!(COMMIT3args, file, offset, count);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3resok {
+    file_wcc: nfs::wcc_data,
+    verf: nfs::writeverf3,
+}
+xdr_struct!(COMMIT3resok, file_wcc, verf);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3resfail {
+    file_wcc: nfs::wcc_data,
+}
+xdr_struct!(COMMIT3resfail, file_wcc);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug)]
+#[repr(u32)]
+enum COMMIT3res {
+    NFS3_OK(COMMIT3resok),
+    Error(nfs::nfsstat3, COMMIT3resfail),
+}
+
+impl XDR for COMMIT3res {
+    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
+        match self {
+            COMMIT3res::NFS3_OK(resok) => {
+                nfs::nfsstat3::NFS3_OK.serialize(dest)?;
+                resok.serialize(dest)?;
+            },
+            COMMIT3res::Error(status, resfail) => {
+                status.serialize(dest)?;
+                resfail.serialize(dest)?;
+            },
+        }
+        Ok(())
+    }
+
+    fn deserialize<R: Read>(&mut self, _src: &mut R) -> std::io::Result<()> {
+        unimplemented!("COMMIT3res deserialize not needed for server")
+    }
+}
+
+pub async fn nfsproc3_commit(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    context: &RPCContext,
+    connection_incarnation: u64,
+) -> Result<(), anyhow::Error> {
+    debug!("Handling COMMIT request: xid = {:?}", xid);
+
+    let mut args = COMMIT3args::default();
+    args.deserialize(input)?;
+
+    if matches!(context.vfs.capabilities(), VFSCapabilities::ReadOnly) {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
         return Ok(());
     }
 
@@ -1172,8 +1341,8 @@ pub async fn nfsproc3_write(
     }
     let id = id.unwrap();
 
-    // get the object attributes before the write
-    let pre_obj_attr = match context.vfs.getattr(id).await {
+    // Get pre-operation attributes
+    let pre_obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1185,24 +1354,44 @@ pub async fn nfsproc3_write(
         Err(_) => nfs::pre_op_attr::Void,
     };
 
-    match context.vfs.write(id, args.offset, &args.data).await {
-        Ok(fattr) => {
-            debug!("write success {:?} --> {:?}", xid, fattr);
-            let res = WRITE3resok {
-                file_wcc: nfs::wcc_data {
-                    before: pre_obj_attr,
-                    after: nfs::post_op_attr::attributes(fattr),
-                },
-                count: args.count,
-                committed: stable_how::FILE_SYNC,
-                verf: context.vfs.serverid(),
+    let commit_context = CommitRequestContext {
+        rpc: RpcRequestContext {
+            xid,
+            client_addr: context.client_addr.clone(),
+            connection_incarnation,
+        },
+    };
+
+    match context
+        .vfs
+        .commit_with_context(&commit_context, &auth_from_context(context), id, args.offset, args.count)
+        .await
+    {
+        Ok(result) => {
+            debug!("commit success {:?}", xid);
+
+            // Get post-operation attributes
+            let post_obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
+                Ok(v) => nfs::post_op_attr::attributes(v),
+                Err(_) => nfs::post_op_attr::Void,
             };
+
+            let file_wcc = nfs::wcc_data {
+                before: pre_obj_attr,
+                after: post_obj_attr,
+            };
+
+            let res = COMMIT3resok {
+                file_wcc,
+                verf: result.verifier,
+            };
+
             make_success_reply(xid).serialize(output)?;
             nfs::nfsstat3::NFS3_OK.serialize(output)?;
             res.serialize(output)?;
         },
         Err(stat) => {
-            error!("write error {:?} --> {:?}", xid, stat);
+            error!("commit error {:?} --> {:?}", xid, stat);
             make_success_reply(xid).serialize(output)?;
             stat.serialize(output)?;
             nfs::wcc_data::default().serialize(output)?;
@@ -1298,7 +1487,7 @@ pub async fn nfsproc3_create(
     let dirid = dirid.unwrap();
 
     // get the object attributes before the write
-    let pre_dir_attr = match context.vfs.getattr(dirid).await {
+    let pre_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1325,11 +1514,16 @@ pub async fn nfsproc3_create(
         createmode3::GUARDED => {
             target_attributes.deserialize(input)?;
             debug!("create guarded {:?}", target_attributes);
-            if context.vfs.lookup(dirid, &dirops.name).await.is_ok() {
+            if context
+                .vfs
+                .lookup(&auth_from_context(context), dirid, &dirops.name)
+                .await
+                .is_ok()
+            {
                 // file exists. Fail with NFS3ERR_EXIST.
                 // Re-read dir attributes
                 // for post op attr
-                let post_dir_attr = match context.vfs.getattr(dirid).await {
+                let post_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
                     Ok(v) => nfs::post_op_attr::attributes(v),
                     Err(_) => nfs::post_op_attr::Void,
                 };
@@ -1355,11 +1549,17 @@ pub async fn nfsproc3_create(
     if matches!(createhow, createmode3::EXCLUSIVE) {
         // the API for exclusive is very slightly different
         // We are not returning a post op attribute
-        fid = context.vfs.create_exclusive(dirid, &dirops.name).await;
+        fid = context
+            .vfs
+            .create_exclusive(&auth_from_context(context), dirid, &dirops.name)
+            .await;
         postopattr = nfs::post_op_attr::Void;
     } else {
         // create!
-        let res = context.vfs.create(dirid, &dirops.name, target_attributes).await;
+        let res = context
+            .vfs
+            .create(&auth_from_context(context), dirid, &dirops.name, target_attributes)
+            .await;
         fid = res.map(|x| x.0);
         postopattr = if let Ok((_, fattr)) = res {
             nfs::post_op_attr::attributes(fattr)
@@ -1369,7 +1569,7 @@ pub async fn nfsproc3_create(
     }
 
     // Re-read dir attributes for post op attr
-    let post_dir_attr = match context.vfs.getattr(dirid).await {
+    let post_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -1479,7 +1679,7 @@ pub async fn nfsproc3_setattr(
 
     let ctime;
 
-    let pre_op_attr = match context.vfs.getattr(id).await {
+    let pre_op_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1508,7 +1708,7 @@ pub async fn nfsproc3_setattr(
         },
     }
 
-    match context.vfs.setattr(id, args.new_attribute).await {
+    match context.vfs.setattr(&auth_from_context(context), id, args.new_attribute).await {
         Ok(post_op_attr) => {
             debug!(" setattr success {:?} --> {:?}", xid, post_op_attr);
             let wcc_res = nfs::wcc_data {
@@ -1587,7 +1787,7 @@ pub async fn nfsproc3_remove(
     let dirid = dirid.unwrap();
 
     // get the object attributes before the write
-    let pre_dir_attr = match context.vfs.getattr(dirid).await {
+    let pre_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1606,10 +1806,10 @@ pub async fn nfsproc3_remove(
     };
 
     // delete!
-    let res = context.vfs.remove(dirid, &dirops.name).await;
+    let res = context.vfs.remove(&auth_from_context(context), dirid, &dirops.name).await;
 
     // Re-read dir attributes for post op attr
-    let post_dir_attr = match context.vfs.getattr(dirid).await {
+    let post_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -1712,7 +1912,7 @@ pub async fn nfsproc3_rename(
     let to_dirid = to_dirid.unwrap();
 
     // get the object attributes before the write
-    let pre_from_dir_attr = match context.vfs.getattr(from_dirid).await {
+    let pre_from_dir_attr = match context.vfs.getattr(&auth_from_context(context), from_dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1731,7 +1931,7 @@ pub async fn nfsproc3_rename(
     };
 
     // get the object attributes before the write
-    let pre_to_dir_attr = match context.vfs.getattr(to_dirid).await {
+    let pre_to_dir_attr = match context.vfs.getattr(&auth_from_context(context), to_dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1750,14 +1950,17 @@ pub async fn nfsproc3_rename(
     };
 
     // rename!
-    let res = context.vfs.rename(from_dirid, &fromdirops.name, to_dirid, &todirops.name).await;
+    let res = context
+        .vfs
+        .rename(&auth_from_context(context), from_dirid, &fromdirops.name, to_dirid, &todirops.name)
+        .await;
 
     // Re-read dir attributes for post op attr
-    let post_from_dir_attr = match context.vfs.getattr(from_dirid).await {
+    let post_from_dir_attr = match context.vfs.getattr(&auth_from_context(context), from_dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
-    let post_to_dir_attr = match context.vfs.getattr(to_dirid).await {
+    let post_to_dir_attr = match context.vfs.getattr(&auth_from_context(context), to_dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -1861,7 +2064,7 @@ pub async fn nfsproc3_mkdir(
     let dirid = dirid.unwrap();
 
     // get the object attributes before the write
-    let pre_dir_attr = match context.vfs.getattr(dirid).await {
+    let pre_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -1879,10 +2082,13 @@ pub async fn nfsproc3_mkdir(
         },
     };
 
-    let res = context.vfs.mkdir(dirid, &args.dirops.name).await;
+    let res = context
+        .vfs
+        .mkdir(&auth_from_context(context), dirid, &args.dirops.name, &args.attributes)
+        .await;
 
     // Re-read dir attributes for post op attr
-    let post_dir_attr = match context.vfs.getattr(dirid).await {
+    let post_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -1987,7 +2193,7 @@ pub async fn nfsproc3_symlink(
     let dirid = dirid.unwrap();
 
     // get the object attributes before the write
-    let pre_dir_attr = match context.vfs.getattr(dirid).await {
+    let pre_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => {
             let wccattr = nfs::wcc_attr {
                 size: v.size,
@@ -2007,11 +2213,17 @@ pub async fn nfsproc3_symlink(
 
     let res = context
         .vfs
-        .symlink(dirid, &args.dirops.name, &args.symlink.symlink_data, &args.symlink.symlink_attributes)
+        .symlink(
+            &auth_from_context(context),
+            dirid,
+            &args.dirops.name,
+            &args.symlink.symlink_data,
+            &args.symlink.symlink_attributes,
+        )
         .await;
 
     // Re-read dir attributes for post op attr
-    let post_dir_attr = match context.vfs.getattr(dirid).await {
+    let post_dir_attr = match context.vfs.getattr(&auth_from_context(context), dirid).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
@@ -2086,7 +2298,7 @@ pub async fn nfsproc3_readlink(
     }
     let id = id.unwrap();
     // if the id does not exist, we fail
-    let symlink_attr = match context.vfs.getattr(id).await {
+    let symlink_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(stat) => {
             make_success_reply(xid).serialize(output)?;
@@ -2095,7 +2307,7 @@ pub async fn nfsproc3_readlink(
             return Ok(());
         },
     };
-    match context.vfs.readlink(id).await {
+    match context.vfs.readlink(&auth_from_context(context), id).await {
         Ok(path) => {
             debug!(" {:?} --> {:?}", xid, path);
             make_success_reply(xid).serialize(output)?;
@@ -2112,4 +2324,457 @@ pub async fn nfsproc3_readlink(
         },
     }
     Ok(())
+}
+
+pub async fn nfsproc3_mknod<W: Write>(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut W,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
+    debug!("mknod {:?}", xid);
+    let mut args = nfs::MKNOD3args {
+        where_: nfs::diropargs3::default(),
+        what: nfs::mknoddata3::NF3REG,
+    };
+    args.deserialize(input)?;
+
+    // Get the parent directory id
+    let parent_id = match context.vfs.fh_to_id(&args.where_.dir) {
+        Ok(id) => id,
+        Err(_) => {
+            let result = nfs::MKNOD3res::Error(
+                nfs::nfsstat3::NFS3ERR_STALE,
+                nfs::MKNOD3resfail {
+                    dir_wcc: nfs::wcc_data::default(),
+                },
+            );
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    // Get pre-operation attributes for parent directory
+    let pre_op_attr = context
+        .vfs
+        .getattr(&auth_from_context(context), parent_id)
+        .await
+        .ok()
+        .map(|attr| {
+            nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                size: attr.size,
+                mtime: attr.mtime,
+                ctime: attr.ctime,
+            })
+        })
+        .unwrap_or(nfs::pre_op_attr::Void);
+
+    // Helper to create wcc_data for the parent directory
+    let get_post_op_attr = || async {
+        context
+            .vfs
+            .getattr(&auth_from_context(context), parent_id)
+            .await
+            .ok()
+            .map(nfs::post_op_attr::attributes)
+            .unwrap_or(nfs::post_op_attr::Void)
+    };
+
+    // Extract file type, attributes, and device spec
+    let (ftype, sattr, spec) = match &args.what {
+        nfs::mknoddata3::NF3CHR(dev) => (nfs::ftype3::NF3CHR, &dev.dev_attributes, Some(&dev.spec)),
+        nfs::mknoddata3::NF3BLK(dev) => (nfs::ftype3::NF3BLK, &dev.dev_attributes, Some(&dev.spec)),
+        nfs::mknoddata3::NF3SOCK(attr) => (nfs::ftype3::NF3SOCK, attr, None),
+        nfs::mknoddata3::NF3FIFO(attr) => (nfs::ftype3::NF3FIFO, attr, None),
+        _ => {
+            // Invalid file type for MKNOD
+            let result = nfs::MKNOD3res::Error(
+                nfs::nfsstat3::NFS3ERR_BADTYPE,
+                nfs::MKNOD3resfail {
+                    dir_wcc: nfs::wcc_data {
+                        before: pre_op_attr,
+                        after: get_post_op_attr().await,
+                    },
+                },
+            );
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    // Create the special file
+    match context
+        .vfs
+        .mknod(&auth_from_context(context), parent_id, &args.where_.name, ftype, sattr, spec)
+        .await
+    {
+        Ok((id, attr)) => {
+            let handle = context.vfs.id_to_fh(id);
+            let result = nfs::MKNOD3res::NFS3_OK(nfs::MKNOD3resok {
+                obj: nfs::post_op_fh3::handle(handle),
+                obj_attributes: nfs::post_op_attr::attributes(attr),
+                dir_wcc: nfs::wcc_data {
+                    before: pre_op_attr,
+                    after: get_post_op_attr().await,
+                },
+            });
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+        },
+        Err(stat) => {
+            let result = nfs::MKNOD3res::Error(
+                stat,
+                nfs::MKNOD3resfail {
+                    dir_wcc: nfs::wcc_data {
+                        before: pre_op_attr,
+                        after: get_post_op_attr().await,
+                    },
+                },
+            );
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+        },
+    }
+
+    Ok(())
+}
+
+pub async fn nfsproc3_link<W: Write>(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut W,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
+    debug!("link {:?}", xid);
+    let mut args = nfs::LINK3args {
+        file: nfs::nfs_fh3::default(),
+        link: nfs::diropargs3::default(),
+    };
+    args.deserialize(input)?;
+
+    // Get the file id
+    let file_id = match context.vfs.fh_to_id(&args.file) {
+        Ok(id) => id,
+        Err(_) => {
+            let result = nfs::LINK3res::Error(nfs::nfsstat3::NFS3ERR_STALE, nfs::LINK3resfail::default());
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    // Get the link directory id
+    let link_dir_id = match context.vfs.fh_to_id(&args.link.dir) {
+        Ok(id) => id,
+        Err(_) => {
+            let result = nfs::LINK3res::Error(nfs::nfsstat3::NFS3ERR_STALE, nfs::LINK3resfail::default());
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    // Get pre-operation attributes
+    let file_pre_attr = context
+        .vfs
+        .getattr(&auth_from_context(context), file_id)
+        .await
+        .ok()
+        .map(nfs::post_op_attr::attributes)
+        .unwrap_or(nfs::post_op_attr::Void);
+
+    let linkdir_pre_attr = context
+        .vfs
+        .getattr(&auth_from_context(context), link_dir_id)
+        .await
+        .ok()
+        .map(|attr| {
+            nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                size: attr.size,
+                mtime: attr.mtime,
+                ctime: attr.ctime,
+            })
+        })
+        .unwrap_or(nfs::pre_op_attr::Void);
+
+    // Helper to get post-operation attributes
+    let get_file_post_attr = || async {
+        context
+            .vfs
+            .getattr(&auth_from_context(context), file_id)
+            .await
+            .ok()
+            .map(nfs::post_op_attr::attributes)
+            .unwrap_or(nfs::post_op_attr::Void)
+    };
+
+    let get_linkdir_post_attr = || async {
+        context
+            .vfs
+            .getattr(&auth_from_context(context), link_dir_id)
+            .await
+            .ok()
+            .map(nfs::post_op_attr::attributes)
+            .unwrap_or(nfs::post_op_attr::Void)
+    };
+
+    // Create the hard link
+    match context
+        .vfs
+        .link(&auth_from_context(context), file_id, link_dir_id, &args.link.name)
+        .await
+    {
+        Ok(()) => {
+            let result = nfs::LINK3res::NFS3_OK(nfs::LINK3resok {
+                file_attributes: get_file_post_attr().await,
+                linkdir_wcc: nfs::wcc_data {
+                    before: linkdir_pre_attr,
+                    after: get_linkdir_post_attr().await,
+                },
+            });
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+        },
+        Err(stat) => {
+            let result = nfs::LINK3res::Error(
+                stat,
+                nfs::LINK3resfail {
+                    file_attributes: file_pre_attr,
+                    linkdir_wcc: nfs::wcc_data {
+                        before: linkdir_pre_attr,
+                        after: get_linkdir_post_attr().await,
+                    },
+                },
+            );
+            make_success_reply(xid).serialize(output)?;
+            result.serialize(output)?;
+        },
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::transaction_tracker::TransactionTracker;
+    use crate::vfs::test_support::ContextRecordingFs;
+    use crate::vfs::NFSFileSystem;
+
+    fn test_context(fs: Arc<ContextRecordingFs>) -> RPCContext {
+        RPCContext {
+            local_port: 2049,
+            client_addr: "127.0.0.1:51000".to_string(),
+            auth: auth_unix {
+                stamp: 0,
+                machinename: b"testhost".to_vec(),
+                uid: 1000,
+                gid: 100,
+                gids: vec![100, 20],
+            },
+            vfs: fs,
+            mount_signal: None,
+            export_name: Arc::new("/".to_string()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+        }
+    }
+
+    #[tokio::test]
+    async fn pathconf_reports_the_filesystem_name_limit() {
+        let context = test_context(Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8])));
+        let mut request = Vec::new();
+        context.vfs.id_to_fh(7).serialize(&mut request).unwrap();
+        let mut reply = Vec::new();
+        nfsproc3_pathconf(7, &mut Cursor::new(request), &mut reply, &context)
+            .await
+            .unwrap();
+
+        let mut reply = Cursor::new(reply);
+        rpc_msg::default().deserialize(&mut reply).unwrap();
+        assert_eq!(reply.read_u32::<XDREndian>().unwrap(), nfs::nfsstat3::NFS3_OK as u32);
+        let mut result = PATHCONF3resok::default();
+        result.deserialize(&mut reply).unwrap();
+        assert_eq!(result.name_max, 1023);
+    }
+
+    #[tokio::test]
+    async fn pathconf_returns_getattr_error_with_absent_attributes() {
+        let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+        fs.getattr_error = Some(nfs::nfsstat3::NFS3ERR_STALE);
+        let context = test_context(Arc::new(fs));
+        let mut request = Vec::new();
+        context.vfs.id_to_fh(7).serialize(&mut request).unwrap();
+        let mut reply = Vec::new();
+        nfsproc3_pathconf(7, &mut Cursor::new(request), &mut reply, &context)
+            .await
+            .unwrap();
+
+        let mut expected = Vec::new();
+        make_success_reply(7).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3ERR_STALE.serialize(&mut expected).unwrap();
+        nfs::post_op_attr::Void.serialize(&mut expected).unwrap();
+        assert_eq!(reply, expected);
+    }
+
+    #[tokio::test]
+    async fn write_forwards_context_and_result_reaches_the_wire() {
+        let verifier: nfs::writeverf3 = [9, 8, 7, 6, 5, 4, 3, 2];
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::UNSTABLE, verifier));
+        let context = test_context(fs.clone());
+        let xid = 0xabcd;
+        let incarnation = 77;
+        let fileid: nfs::fileid3 = 42;
+        let data = b"some bytes".to_vec();
+
+        let args = WRITE3args {
+            file: fs.id_to_fh(fileid),
+            offset: 4096,
+            count: data.len() as u32,
+            stable: stable_how::DATA_SYNC as u32,
+            data: data.clone(),
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_write(xid, &mut Cursor::new(request), &mut output, &context, incarnation)
+            .await
+            .unwrap();
+
+        {
+            let writes = fs.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            let captured = &writes[0];
+            assert_eq!(captured.xid, xid);
+            assert_eq!(captured.client_addr, context.client_addr);
+            assert_eq!(captured.connection_incarnation, incarnation);
+            assert_eq!(captured.requested_stability, stable_how::DATA_SYNC);
+            assert_eq!(captured.auth.uid, 1000);
+            assert_eq!(captured.auth.gid, 100);
+            assert_eq!(captured.auth.gids, vec![100, 20]);
+            assert_eq!(captured.id, fileid);
+            assert_eq!(captured.offset, 4096);
+            assert_eq!(captured.data, data);
+        }
+        // the handler must not also invoke the legacy path
+        assert_eq!(fs.legacy_write_calls.load(Ordering::SeqCst), 0);
+
+        // the returned committed level and verifier must reach the wire
+        let pre = ContextRecordingFs::attr(fileid, 512);
+        let mut expected = Vec::new();
+        make_success_reply(xid).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3_OK.serialize(&mut expected).unwrap();
+        WRITE3resok {
+            file_wcc: nfs::wcc_data {
+                before: nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                    size: pre.size,
+                    mtime: pre.mtime,
+                    ctime: pre.ctime,
+                }),
+                after: nfs::post_op_attr::attributes(ContextRecordingFs::attr(fileid, 4096 + data.len() as u64)),
+            },
+            count: data.len() as u32,
+            committed: stable_how::UNSTABLE,
+            verf: verifier,
+        }
+        .serialize(&mut expected)
+        .unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn write_with_invalid_stable_how_returns_garbage_args() {
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, [0u8; nfs::NFS3_WRITEVERFSIZE as usize]));
+        let context = test_context(fs.clone());
+        let xid = 99;
+        let data = b"abc".to_vec();
+
+        let args = WRITE3args {
+            file: fs.id_to_fh(7),
+            offset: 0,
+            count: data.len() as u32,
+            stable: 3, // not a valid stable_how value
+            data,
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_write(xid, &mut Cursor::new(request), &mut output, &context, 1)
+            .await
+            .unwrap();
+
+        assert!(fs.writes.lock().unwrap().is_empty());
+        assert_eq!(fs.legacy_write_calls.load(Ordering::SeqCst), 0);
+
+        let mut expected = Vec::new();
+        garbage_args_reply_message(xid).serialize(&mut expected).unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn commit_forwards_context_and_verifier_reaches_the_wire() {
+        let verifier: nfs::writeverf3 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, verifier));
+        let context = test_context(fs.clone());
+        let xid = 0x1234;
+        let incarnation = 5;
+        let fileid: nfs::fileid3 = 8;
+
+        let args = COMMIT3args {
+            file: fs.id_to_fh(fileid),
+            offset: 100,
+            count: 200,
+        };
+        let mut request = Vec::new();
+        args.serialize(&mut request).unwrap();
+
+        let mut output = Vec::new();
+        nfsproc3_commit(xid, &mut Cursor::new(request), &mut output, &context, incarnation)
+            .await
+            .unwrap();
+
+        {
+            let commits = fs.commits.lock().unwrap();
+            assert_eq!(commits.len(), 1);
+            let captured = &commits[0];
+            assert_eq!(captured.xid, xid);
+            assert_eq!(captured.client_addr, context.client_addr);
+            assert_eq!(captured.connection_incarnation, incarnation);
+            assert_eq!(captured.auth.uid, 1000);
+            assert_eq!(captured.auth.gid, 100);
+            assert_eq!(captured.auth.gids, vec![100, 20]);
+            assert_eq!(captured.fileid, fileid);
+            assert_eq!(captured.offset, 100);
+            assert_eq!(captured.count, 200);
+        }
+        // the handler must not also invoke the legacy path
+        assert_eq!(fs.legacy_commit_calls.load(Ordering::SeqCst), 0);
+
+        let attr = ContextRecordingFs::attr(fileid, 512);
+        let mut expected = Vec::new();
+        make_success_reply(xid).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3_OK.serialize(&mut expected).unwrap();
+        COMMIT3resok {
+            file_wcc: nfs::wcc_data {
+                before: nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                    size: attr.size,
+                    mtime: attr.mtime,
+                    ctime: attr.ctime,
+                }),
+                after: nfs::post_op_attr::attributes(attr),
+            },
+            verf: verifier,
+        }
+        .serialize(&mut expected)
+        .unwrap();
+        assert_eq!(output, expected);
+    }
 }

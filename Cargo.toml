@@ -1,17 +1,16 @@
 [package]
-name = "nfsserve"
-version = "0.11.0"
+name = "zerofs_nfsserve"
+version = "0.20.0"
 edition = "2021"
-authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]
+authors = ["Yucheng Low <ylow@xethub.com>", "Pierre Barre <pierre@barre.sh>"]
 description = "A Rust NFS Server implementation"
-homepage = "https://github.com/huggingface/nfsserve"
-repository = "https://github.com/huggingface/nfsserve"
+repository = "https://github.com/ScriptedAlchemy/nfsserve"
 readme = "README.md"
 keywords = ["nfs"]
-license = "BSD-3-Clause"
+license = "AGPL-3.0"
 categories = ["network-programming", "filesystem"]
 publish = true
-include = ["src/**/*", "src/*", "Cargo.toml", "LICENSE", "README.md"]
+include = ["src/**", "examples/**", "Cargo.toml", "LICENSE", "LICENSE-MODIFICATIONS", "README.md"]
 
 
 [lib]
@@ -21,15 +20,30 @@ doctest = false
 byteorder = "1.4"
 num-traits = "0.2"
 num-derive = "0.4"
-tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros"], default-features = false }
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "sync",
+    "fs",
+    "rt",
+    "macros",
+    "time",
+], default-features = false }
+tokio-util = "0.7"
+futures = "0.3.21"
 tracing = "0.1.31"
 anyhow = "1"
 async-trait = "0.1.9"
 filetime = "0.2"
 
 # demo
-tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
+tracing-subscriber = { version = "0.3", features = [
+    "tracing-log",
+], optional = true }
 intaglio = { version = "1.6", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [features]
 strict = []

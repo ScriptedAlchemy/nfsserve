@@ -3,6 +3,8 @@ use std::fs::{Metadata, Permissions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+use rustix::fs::{futimens, utimensat, AtFlags, Timespec, Timestamps, CWD, UTIME_NOW, UTIME_OMIT};
+use rustix::io::Errno;
 use tokio::fs::OpenOptions;
 use tracing::debug;
 
@@ -118,26 +120,56 @@ pub fn metadata_to_fattr3(fid: fileid3, meta: &Metadata) -> fattr3 {
     }
 }
 
+fn client_time(time: nfstime3) -> Result<Timespec, nfsstat3> {
+    if time.nseconds >= 1_000_000_000 {
+        return Err(nfsstat3::NFS3ERR_INVAL);
+    }
+    Ok(Timespec {
+        tv_sec: time.seconds.into(),
+        tv_nsec: time.nseconds as _,
+    })
+}
+
+fn requested_times(setattr: &sattr3) -> Result<Option<Timestamps>, nfsstat3> {
+    let omit = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_OMIT,
+    };
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    let last_access = match setattr.atime {
+        set_atime::DONT_CHANGE => omit,
+        set_atime::SET_TO_SERVER_TIME => now,
+        set_atime::SET_TO_CLIENT_TIME(time) => client_time(time)?,
+    };
+    let last_modification = match setattr.mtime {
+        set_mtime::DONT_CHANGE => omit,
+        set_mtime::SET_TO_SERVER_TIME => now,
+        set_mtime::SET_TO_CLIENT_TIME(time) => client_time(time)?,
+    };
+    Ok((last_access != omit || last_modification != omit).then_some(Timestamps {
+        last_access,
+        last_modification,
+    }))
+}
+
+fn timestamp_error(err: Errno) -> nfsstat3 {
+    match err {
+        Errno::ACCESS => nfsstat3::NFS3ERR_ACCES,
+        Errno::PERM => nfsstat3::NFS3ERR_PERM,
+        Errno::NOENT => nfsstat3::NFS3ERR_NOENT,
+        Errno::NOTDIR => nfsstat3::NFS3ERR_NOTDIR,
+        Errno::ROFS => nfsstat3::NFS3ERR_ROFS,
+        Errno::INVAL => nfsstat3::NFS3ERR_INVAL,
+        _ => nfsstat3::NFS3ERR_IO,
+    }
+}
+
 /// Set attributes of a path
 pub async fn path_setattr(path: &Path, setattr: &sattr3) -> Result<(), nfsstat3> {
-    match setattr.atime {
-        set_atime::SET_TO_SERVER_TIME => {
-            let _ = filetime::set_file_atime(path, filetime::FileTime::now());
-        },
-        set_atime::SET_TO_CLIENT_TIME(time) => {
-            let _ = filetime::set_file_atime(path, time.into());
-        },
-        _ => {},
-    };
-    match setattr.mtime {
-        set_mtime::SET_TO_SERVER_TIME => {
-            let _ = filetime::set_file_mtime(path, filetime::FileTime::now());
-        },
-        set_mtime::SET_TO_CLIENT_TIME(time) => {
-            let _ = filetime::set_file_mtime(path, time.into());
-        },
-        _ => {},
-    };
+    let times = requested_times(setattr)?;
     if let set_mode3::mode(mode) = setattr.mode {
         debug!(" -- set permissions {:?} {:?}", path, mode);
         let mode = mode_unmask(mode);
@@ -160,11 +192,15 @@ pub async fn path_setattr(path: &Path, setattr: &sattr3) -> Result<(), nfsstat3>
         debug!(" -- set size {:?} {:?}", path, size3);
         file.set_len(size3).await.or(Err(nfsstat3::NFS3ERR_IO))?;
     }
+    if let Some(times) = times {
+        utimensat(CWD, path, &times, AtFlags::empty()).map_err(timestamp_error)?;
+    }
     Ok(())
 }
 
 /// Set attributes of a file
 pub async fn file_setattr(file: &std::fs::File, setattr: &sattr3) -> Result<(), nfsstat3> {
+    let times = requested_times(setattr)?;
     if let set_mode3::mode(mode) = setattr.mode {
         debug!(" -- set permissions {:?}", mode);
         let mode = mode_unmask(mode);
@@ -174,5 +210,73 @@ pub async fn file_setattr(file: &std::fs::File, setattr: &sattr3) -> Result<(), 
         debug!(" -- set size {:?}", size3);
         file.set_len(size3).or(Err(nfsstat3::NFS3ERR_IO))?;
     }
+    if let Some(times) = times {
+        futimens(file, &times).map_err(timestamp_error)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setattr_preserves_omitted_times_and_uses_the_open_file() {
+        let path = std::env::temp_dir().join(format!("nfsserve-setattr-times-{}", std::process::id()));
+        let file = std::fs::File::create_new(&path).unwrap();
+        let access = nfstime3 {
+            seconds: 1_600_000_000,
+            nseconds: 100,
+        };
+        let modified = nfstime3 {
+            seconds: 1_610_000_000,
+            nseconds: 200,
+        };
+        path_setattr(
+            &path,
+            &sattr3 {
+                atime: set_atime::SET_TO_CLIENT_TIME(access),
+                ..sattr3::default()
+            },
+        )
+        .await
+        .unwrap();
+        path_setattr(
+            &path,
+            &sattr3 {
+                size: set_size3::size(7),
+                mtime: set_mtime::SET_TO_CLIENT_TIME(modified),
+                ..sattr3::default()
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.len(), 7);
+        assert_eq!((meta.atime(), meta.atime_nsec()), (1_600_000_000, 100));
+        assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_610_000_000, 200));
+
+        let attrs = sattr3 {
+            atime: set_atime::SET_TO_SERVER_TIME,
+            ..sattr3::default()
+        };
+        assert!(matches!(path_setattr(&path, &attrs).await, Err(nfsstat3::NFS3ERR_NOENT)));
+        file_setattr(&file, &attrs).await.unwrap();
+        let meta = file.metadata().unwrap();
+        assert_ne!((meta.atime(), meta.atime_nsec()), (1_600_000_000, 100));
+        assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_610_000_000, 200));
+    }
+
+    #[test]
+    fn invalid_client_nanoseconds_are_rejected() {
+        let attrs = sattr3 {
+            mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                seconds: 0,
+                nseconds: 1_000_000_000,
+            }),
+            ..sattr3::default()
+        };
+        assert!(matches!(requested_times(&attrs), Err(nfsstat3::NFS3ERR_INVAL)));
+    }
 }

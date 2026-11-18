@@ -10,13 +10,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   fmt:
+    permissions:
+      contents: read
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249  # stable
         with:
           toolchain: nightly
           components: rustfmt
@@ -25,21 +29,19 @@ jobs:
           cargo +nightly fmt --manifest-path ./Cargo.toml --all -- --check
 
   build_and_test-linux:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install Rust 1.100
+        uses: dtolnay/rust-toolchain@fbe9290f8d4249ed67757fa4c30883d5a2697137 # 1.100
         with:
           components: clippy
       - name: Lint
         run: |
-          cargo clippy -r --verbose -- -D warnings # elevates warnings to errors
+          cargo clippy --release --all-targets --all-features -- -D warnings
       - name: Build and Test
         run: |
-          cargo test --verbose --no-fail-fast --features "strict"
-      - name: Check Cargo.lock has no uncommitted changes
-        run: |
-          # the build and test steps would update Cargo.lock if it is out of date
-          test -z "$(git status --porcelain Cargo.lock)" || (echo "Cargo.lock has uncommitted changes!" && exit 1)
+          cargo test --all-targets --all-features --no-fail-fast

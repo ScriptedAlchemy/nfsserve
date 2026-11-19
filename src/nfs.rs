@@ -38,6 +38,23 @@ pub const NFS3_CREATEVERFSIZE: u32 = 8;
 /// asynchronous WRITE.
 pub const NFS3_WRITEVERFSIZE: u32 = 8;
 
+// Section 3.3.4 ACCESS permissions.
+/// Read file data or list a directory.
+pub const ACCESS3_READ: u32 = 0x0001;
+/// Look up names in a directory.
+pub const ACCESS3_LOOKUP: u32 = 0x0002;
+/// Rewrite file data or modify directory entries.
+pub const ACCESS3_MODIFY: u32 = 0x0004;
+/// Append file data or add directory entries.
+pub const ACCESS3_EXTEND: u32 = 0x0008;
+/// Delete directory entries (not applicable to non-directory objects on Unix).
+pub const ACCESS3_DELETE: u32 = 0x0010;
+/// Execute a non-directory object.
+pub const ACCESS3_EXECUTE: u32 = 0x0020;
+/// All defined NFSv3 ACCESS permissions.
+pub const ACCESS3_ALL: u32 =
+    ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE | ACCESS3_EXECUTE;
+
 // Section 2.5 Basic Data Types
 #[allow(non_camel_case_types)]
 #[derive(Default, Clone)]

@@ -507,12 +507,6 @@ pub async fn nfsproc3_fsinfo(
     Ok(())
 }
 
-const ACCESS3_READ: u32 = 0x0001;
-const ACCESS3_LOOKUP: u32 = 0x0002;
-const ACCESS3_MODIFY: u32 = 0x0004;
-const ACCESS3_EXTEND: u32 = 0x0008;
-const ACCESS3_DELETE: u32 = 0x0010;
-const ACCESS3_EXECUTE: u32 = 0x0020;
 /*
 
  ACCESS3res NFSPROC3_ACCESS(ACCESS3args) = 4;
@@ -562,19 +556,27 @@ pub async fn nfsproc3_access(
     }
     let id = id.unwrap();
 
-    let obj_attr = match context.vfs.getattr(&auth_from_context(context), id).await {
-        Ok(v) => nfs::post_op_attr::attributes(v),
-        Err(_) => nfs::post_op_attr::Void,
-    };
-    // TODO better checks here
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        access &= ACCESS3_READ | ACCESS3_LOOKUP;
-    }
-    debug!(" {:?} ---> {:?}", xid, access);
+    // Unknown permissions are unsupported, and the backend may only grant
+    // permissions that the caller actually requested.
+    let requested = access & nfs::ACCESS3_ALL;
+    let result = context.vfs.access(&auth_from_context(context), id, requested).await;
     make_success_reply(xid).serialize(output)?;
-    nfs::nfsstat3::NFS3_OK.serialize(output)?;
-    obj_attr.serialize(output)?;
-    access.serialize(output)?;
+    match result {
+        Ok(result) => {
+            let mut access = result.access & requested;
+            if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+                access &= nfs::ACCESS3_READ | nfs::ACCESS3_LOOKUP | nfs::ACCESS3_EXECUTE;
+            }
+            debug!(" {:?} ---> {:?}", xid, access);
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            nfs::post_op_attr::attributes(result.attributes).serialize(output)?;
+            access.serialize(output)?;
+        },
+        Err(status) => {
+            status.serialize(output)?;
+            nfs::post_op_attr::Void.serialize(output)?;
+        },
+    }
     Ok(())
 }
 
@@ -2566,7 +2568,7 @@ mod tests {
     use super::*;
     use crate::transaction_tracker::TransactionTracker;
     use crate::vfs::test_support::ContextRecordingFs;
-    use crate::vfs::NFSFileSystem;
+    use crate::vfs::{AccessResult, NFSFileSystem};
 
     fn test_context(fs: Arc<ContextRecordingFs>) -> RPCContext {
         RPCContext {
@@ -2584,6 +2586,140 @@ mod tests {
             export_name: Arc::new("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
         }
+    }
+
+    async fn access_reply(context: &RPCContext, handle: nfs::nfs_fh3, requested: u32) -> Vec<u8> {
+        let mut request = Vec::new();
+        handle.serialize(&mut request).unwrap();
+        requested.serialize(&mut request).unwrap();
+        let mut reply = Vec::new();
+        nfsproc3_access(7, &mut Cursor::new(request), &mut reply, context)
+            .await
+            .unwrap();
+        reply
+    }
+
+    fn expected_access_success(attributes: nfs::fattr3, access: u32) -> Vec<u8> {
+        let mut expected = Vec::new();
+        make_success_reply(7).serialize(&mut expected).unwrap();
+        nfs::nfsstat3::NFS3_OK.serialize(&mut expected).unwrap();
+        nfs::post_op_attr::attributes(attributes).serialize(&mut expected).unwrap();
+        access.serialize(&mut expected).unwrap();
+        expected
+    }
+
+    fn expected_access_error(status: nfs::nfsstat3) -> Vec<u8> {
+        let mut expected = Vec::new();
+        make_success_reply(7).serialize(&mut expected).unwrap();
+        status.serialize(&mut expected).unwrap();
+        nfs::post_op_attr::Void.serialize(&mut expected).unwrap();
+        expected
+    }
+
+    #[tokio::test]
+    async fn access_forwards_credentials_and_the_backend_decision_with_exact_attributes() {
+        let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+        // The backend may use ACLs or mapped identities that cannot be inferred
+        // from Unix mode bits. Its attributes must not be fetched a second time.
+        let attributes = nfs::fattr3 {
+            mode: 0,
+            uid: 4000,
+            ..ContextRecordingFs::attr(42, 9876)
+        };
+        fs.getattr_error = Some(nfs::nfsstat3::NFS3ERR_IO);
+        fs.access_result = Some(Ok(AccessResult {
+            attributes,
+            access: nfs::ACCESS3_READ,
+        }));
+        let fs = Arc::new(fs);
+        let context = test_context(fs.clone());
+
+        let reply = access_reply(&context, fs.id_to_fh(42), nfs::ACCESS3_ALL).await;
+        assert_eq!(reply, expected_access_success(attributes, nfs::ACCESS3_READ));
+        assert_eq!(fs.getattr_calls.load(Ordering::SeqCst), 0);
+        let calls = fs.accesses.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, 42);
+        assert_eq!(calls[0].requested, nfs::ACCESS3_ALL);
+        assert_eq!(calls[0].auth.uid, 1000);
+        assert_eq!(calls[0].auth.gid, 100);
+        assert_eq!(calls[0].auth.gids, vec![100, 20]);
+    }
+
+    #[tokio::test]
+    async fn access_returns_success_with_no_permissions_when_the_backend_denies_access() {
+        let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+        let attributes = nfs::fattr3 {
+            mode: 0o777,
+            ..ContextRecordingFs::attr(42, 512)
+        };
+        fs.access_result = Some(Ok(AccessResult { attributes, access: 0 }));
+        let context = test_context(Arc::new(fs));
+        let reply = access_reply(&context, context.vfs.id_to_fh(42), nfs::ACCESS3_ALL).await;
+        assert_eq!(reply, expected_access_success(attributes, 0));
+    }
+
+    #[tokio::test]
+    async fn access_never_reports_unknown_or_unrequested_permissions() {
+        let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+        let attributes = ContextRecordingFs::attr(42, 512);
+        fs.access_result = Some(Ok(AccessResult {
+            attributes,
+            access: u32::MAX,
+        }));
+        let fs = Arc::new(fs);
+        let context = test_context(fs.clone());
+        let reply = access_reply(&context, fs.id_to_fh(42), nfs::ACCESS3_READ | (1 << 31)).await;
+        assert_eq!(reply, expected_access_success(attributes, nfs::ACCESS3_READ));
+        assert_eq!(fs.accesses.lock().unwrap()[0].requested, nfs::ACCESS3_READ);
+    }
+
+    #[tokio::test]
+    async fn access_preserves_execute_on_read_only_exports_without_granting_mutations() {
+        let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+        let attributes = ContextRecordingFs::attr(42, 512);
+        fs.read_only = true;
+        fs.access_result = Some(Ok(AccessResult {
+            attributes,
+            access: nfs::ACCESS3_ALL,
+        }));
+        let context = test_context(Arc::new(fs));
+        let requested =
+            nfs::ACCESS3_READ | nfs::ACCESS3_EXECUTE | nfs::ACCESS3_MODIFY | nfs::ACCESS3_EXTEND | nfs::ACCESS3_DELETE;
+        let reply = access_reply(&context, context.vfs.id_to_fh(42), requested).await;
+        assert_eq!(reply, expected_access_success(attributes, nfs::ACCESS3_READ | nfs::ACCESS3_EXECUTE));
+    }
+
+    #[tokio::test]
+    async fn access_propagates_backend_errors_without_a_success_permissions_payload() {
+        for status in [
+            nfs::nfsstat3::NFS3ERR_NOENT,
+            nfs::nfsstat3::NFS3ERR_STALE,
+            nfs::nfsstat3::NFS3ERR_IO,
+        ] {
+            let mut fs = ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]);
+            fs.access_result = Some(Err(status));
+            let fs = Arc::new(fs);
+            let context = test_context(fs.clone());
+            // Even an empty or entirely unsupported request must validate the
+            // object rather than succeed for a missing inode or a stale handle.
+            for requested in [nfs::ACCESS3_ALL, 0, 1 << 31] {
+                let reply = access_reply(&context, fs.id_to_fh(42), requested).await;
+                assert_eq!(reply, expected_access_error(status));
+            }
+            assert_eq!(fs.getattr_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fs.accesses.lock().unwrap().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn access_rejects_invalid_handles_without_calling_the_backend() {
+        let fs = Arc::new(ContextRecordingFs::new(stable_how::FILE_SYNC, [0; 8]));
+        let context = test_context(fs.clone());
+        let reply = access_reply(&context, nfs::nfs_fh3 { data: vec![1, 2, 3] }, nfs::ACCESS3_ALL).await;
+        assert_eq!(reply, expected_access_error(nfs::nfsstat3::NFS3ERR_BADHANDLE));
+        assert!(fs.accesses.lock().unwrap().is_empty());
+        assert_eq!(fs.getattr_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

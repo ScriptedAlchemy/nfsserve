@@ -82,6 +82,50 @@ pub enum VFSCapabilities {
     ReadWrite,
 }
 
+/// Result of checking the caller's NFSv3 ACCESS permissions.
+#[derive(Clone, Debug)]
+pub struct AccessResult {
+    /// Attributes from the same filesystem state used for the access check.
+    pub attributes: fattr3,
+    /// The subset of requested [`ACCESS3_ALL`] permissions that is allowed.
+    pub access: u32,
+}
+
+/// Unix mode-bit fallback for filesystems without ACLs or identity remapping.
+fn mode_access(auth: &AuthContext, attributes: &fattr3, requested: u32, capabilities: VFSCapabilities) -> u32 {
+    let is_directory = matches!(attributes.ftype, ftype3::NF3DIR);
+    let permissions = if auth.uid == 0 {
+        // Root can search directories, but may only execute a regular file
+        // if at least one execute bit is set.
+        0o6 | u32::from(is_directory || attributes.mode & 0o111 != 0)
+    } else if auth.uid == attributes.uid {
+        (attributes.mode >> 6) & 0o7
+    } else if auth.is_member_of_group(attributes.gid) {
+        (attributes.mode >> 3) & 0o7
+    } else {
+        attributes.mode & 0o7
+    };
+
+    let mut access = 0;
+    if permissions & 0o4 != 0 {
+        access |= ACCESS3_READ;
+    }
+    if permissions & 0o1 != 0 {
+        access |= if is_directory { ACCESS3_LOOKUP } else { ACCESS3_EXECUTE };
+    }
+    if matches!(capabilities, VFSCapabilities::ReadWrite) {
+        if is_directory {
+            // Each directory mutation requires write AND search permission.
+            if permissions & 0o3 == 0o3 {
+                access |= ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE;
+            }
+        } else if permissions & 0o2 != 0 {
+            access |= ACCESS3_MODIFY | ACCESS3_EXTEND;
+        }
+    }
+    access & requested
+}
+
 /// Transport-level metadata describing the RPC request being served
 #[derive(Clone, Debug)]
 pub struct RpcRequestContext {
@@ -182,6 +226,26 @@ pub trait NFSFileSystem: Sync {
     /// Returns the attributes of an id.
     /// This method should be fast as it is used very frequently.
     async fn getattr(&self, auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3>;
+
+    /// Check the caller's permissions for an object (NFSv3 ACCESS).
+    ///
+    /// Report each requested `ACCESS3_*` permission independently and leave
+    /// denied permissions unset; a normal denial is `Ok` with no corresponding
+    /// bit, not an error. Return errors for failures such as a stale handle or
+    /// unavailable storage. Attributes and permissions should describe the same
+    /// filesystem state.
+    ///
+    /// The default checks Unix owner/group/other mode bits using [`Self::getattr`]
+    /// and treats uid 0 as privileged. Filesystems with ACLs, identity mapping,
+    /// root squashing, or other access restrictions MUST override this method
+    /// with their authoritative permission checks. Clients can use ACCESS to
+    /// authorize opening data already in their local cache, without a new READ
+    /// request reaching the server.
+    async fn access(&self, auth: &AuthContext, id: fileid3, requested: u32) -> Result<AccessResult, nfsstat3> {
+        let attributes = self.getattr(auth, id).await?;
+        let access = mode_access(auth, &attributes, requested, self.capabilities());
+        Ok(AccessResult { attributes, access })
+    }
 
     /// Sets the attributes of an id
     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
@@ -492,10 +556,21 @@ pub(crate) mod test_support {
         pub(crate) count: u32,
     }
 
-    /// Test filesystem that records contextual write/commit calls and
-    /// returns a configurable committed level and verifier.
+    #[derive(Clone, Debug)]
+    pub(crate) struct CapturedAccess {
+        pub(crate) auth: AuthContext,
+        pub(crate) id: fileid3,
+        pub(crate) requested: u32,
+    }
+
+    /// Test filesystem that records access/write/commit calls and returns
+    /// configurable access and durability results.
     pub(crate) struct ContextRecordingFs {
         pub(crate) getattr_error: Option<nfsstat3>,
+        pub(crate) getattr_calls: AtomicUsize,
+        pub(crate) read_only: bool,
+        pub(crate) access_result: Option<Result<AccessResult, nfsstat3>>,
+        pub(crate) accesses: Mutex<Vec<CapturedAccess>>,
         pub(crate) committed: stable_how,
         pub(crate) verifier: writeverf3,
         pub(crate) writes: Arc<Mutex<Vec<CapturedWrite>>>,
@@ -508,6 +583,10 @@ pub(crate) mod test_support {
         pub(crate) fn new(committed: stable_how, verifier: writeverf3) -> ContextRecordingFs {
             ContextRecordingFs {
                 getattr_error: None,
+                getattr_calls: AtomicUsize::new(0),
+                read_only: false,
+                access_result: None,
+                accesses: Mutex::new(Vec::new()),
                 committed,
                 verifier,
                 writes: Arc::new(Mutex::new(Vec::new())),
@@ -540,7 +619,11 @@ pub(crate) mod test_support {
             1023
         }
         fn capabilities(&self) -> VFSCapabilities {
-            VFSCapabilities::ReadWrite
+            if self.read_only {
+                VFSCapabilities::ReadOnly
+            } else {
+                VFSCapabilities::ReadWrite
+            }
         }
         fn root_dir(&self) -> fileid3 {
             1
@@ -554,9 +637,21 @@ pub(crate) mod test_support {
             Err(nfsstat3::NFS3ERR_NOTSUPP)
         }
         async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
+            self.getattr_calls.fetch_add(1, Ordering::SeqCst);
             match self.getattr_error {
                 Some(status) => Err(status),
                 None => Ok(Self::attr(id, 512)),
+            }
+        }
+        async fn access(&self, auth: &AuthContext, id: fileid3, requested: u32) -> Result<AccessResult, nfsstat3> {
+            self.accesses.lock().unwrap().push(CapturedAccess {
+                auth: auth.clone(),
+                id,
+                requested,
+            });
+            match &self.access_result {
+                Some(result) => result.clone(),
+                None => Err(nfsstat3::NFS3ERR_NOTSUPP),
             }
         }
         async fn setattr(&self, _auth: &AuthContext, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -748,6 +843,8 @@ mod tests {
     struct RecordingFs {
         write_calls: AtomicUsize,
         commit_calls: AtomicUsize,
+        attributes: Option<fattr3>,
+        read_only: bool,
     }
 
     impl RecordingFs {
@@ -755,14 +852,148 @@ mod tests {
             RecordingFs {
                 write_calls: AtomicUsize::new(0),
                 commit_calls: AtomicUsize::new(0),
+                attributes: None,
+                read_only: false,
             }
         }
+    }
+
+    fn access_fs(ftype: ftype3, mode: u32) -> RecordingFs {
+        let mut fs = RecordingFs::new();
+        fs.attributes = Some(fattr3 {
+            ftype,
+            mode,
+            fileid: 42,
+            uid: 1000,
+            gid: 100,
+            ..Default::default()
+        });
+        fs
+    }
+
+    #[tokio::test]
+    async fn default_access_uses_owner_group_and_other_permissions() {
+        let fs = access_fs(ftype3::NF3REG, 0o641);
+        let cases = [
+            (auth(), ACCESS3_READ | ACCESS3_MODIFY | ACCESS3_EXTEND),
+            (
+                AuthContext {
+                    uid: 2000,
+                    gid: 100,
+                    gids: vec![],
+                },
+                ACCESS3_READ,
+            ),
+            (
+                AuthContext {
+                    uid: 2000,
+                    gid: 200,
+                    gids: vec![100],
+                },
+                ACCESS3_READ,
+            ),
+            (
+                AuthContext {
+                    uid: 2000,
+                    gid: 200,
+                    gids: vec![],
+                },
+                ACCESS3_EXECUTE,
+            ),
+        ];
+        for (auth, expected) in cases {
+            let result = fs.access(&auth, 42, ACCESS3_ALL).await.unwrap();
+            assert_eq!(result.access, expected, "{auth:?}");
+            assert_eq!(result.attributes.fileid, 42);
+            assert_eq!(result.attributes.mode, 0o641);
+            assert_eq!(result.attributes.uid, 1000);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_access_does_not_fall_back_from_owner_or_group_to_other() {
+        let owner_fs = access_fs(ftype3::NF3REG, 0o077);
+        assert_eq!(owner_fs.access(&auth(), 42, ACCESS3_ALL).await.unwrap().access, 0);
+
+        let group_fs = access_fs(ftype3::NF3REG, 0o707);
+        let group = AuthContext {
+            uid: 2000,
+            gid: 100,
+            gids: vec![],
+        };
+        assert_eq!(group_fs.access(&group, 42, ACCESS3_ALL).await.unwrap().access, 0);
+    }
+
+    #[tokio::test]
+    async fn default_access_requires_write_and_search_for_directory_mutations() {
+        let cases = [
+            (0o200, 0),
+            (0o100, ACCESS3_LOOKUP),
+            (0o400, ACCESS3_READ),
+            (0o700, ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE),
+        ];
+        for (mode, expected) in cases {
+            let fs = access_fs(ftype3::NF3DIR, mode);
+            assert_eq!(fs.access(&auth(), 42, ACCESS3_ALL).await.unwrap().access, expected, "mode {mode:o}");
+        }
+        let fs = access_fs(ftype3::NF3REG, 0o777);
+        assert_eq!(fs.access(&auth(), 42, ACCESS3_LOOKUP | ACCESS3_DELETE).await.unwrap().access, 0);
+    }
+
+    #[tokio::test]
+    async fn default_access_retains_execute_and_lookup_on_read_only_filesystems() {
+        for (ftype, expected) in [
+            (ftype3::NF3REG, ACCESS3_READ | ACCESS3_EXECUTE),
+            (ftype3::NF3DIR, ACCESS3_READ | ACCESS3_LOOKUP),
+        ] {
+            let mut fs = access_fs(ftype, 0o777);
+            fs.read_only = true;
+            assert_eq!(fs.access(&auth(), 42, ACCESS3_ALL).await.unwrap().access, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_access_root_requires_an_execute_bit_on_non_directories() {
+        let root = AuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+        let cases = [
+            (ftype3::NF3REG, 0o000, ACCESS3_READ | ACCESS3_MODIFY | ACCESS3_EXTEND),
+            (ftype3::NF3REG, 0o001, ACCESS3_READ | ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_EXECUTE),
+            (
+                ftype3::NF3DIR,
+                0o000,
+                ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE,
+            ),
+        ];
+        for (ftype, mode, expected) in cases {
+            let fs = access_fs(ftype, mode);
+            assert_eq!(fs.access(&root, 42, ACCESS3_ALL).await.unwrap().access, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_access_only_reports_supported_requested_permissions() {
+        let fs = access_fs(ftype3::NF3REG, 0o777);
+        assert_eq!(fs.access(&auth(), 42, ACCESS3_READ | (1 << 31)).await.unwrap().access, ACCESS3_READ);
+        assert_eq!(fs.access(&auth(), 42, 0).await.unwrap().access, 0);
+    }
+
+    #[tokio::test]
+    async fn default_access_propagates_getattr_errors() {
+        assert!(matches!(RecordingFs::new().access(&auth(), 42, ACCESS3_ALL).await, Err(nfsstat3::NFS3ERR_NOTSUPP)));
     }
 
     #[async_trait]
     impl NFSFileSystem for RecordingFs {
         fn capabilities(&self) -> VFSCapabilities {
-            VFSCapabilities::ReadWrite
+            if self.read_only {
+                VFSCapabilities::ReadOnly
+            } else {
+                VFSCapabilities::ReadWrite
+            }
         }
         fn root_dir(&self) -> fileid3 {
             1
@@ -776,7 +1007,7 @@ mod tests {
             Err(nfsstat3::NFS3ERR_NOTSUPP)
         }
         async fn getattr(&self, _auth: &AuthContext, _id: fileid3) -> Result<fattr3, nfsstat3> {
-            Err(nfsstat3::NFS3ERR_NOTSUPP)
+            self.attributes.ok_or(nfsstat3::NFS3ERR_NOTSUPP)
         }
         async fn setattr(&self, _auth: &AuthContext, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
             Err(nfsstat3::NFS3ERR_NOTSUPP)

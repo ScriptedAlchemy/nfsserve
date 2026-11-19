@@ -73,6 +73,16 @@ The TCP listener admits at most 64 active connections. RPC record assembly and
 reply transmission each have a 30-second no-progress deadline and a 120-second
 total deadline, so stalled or drip-fed peers cannot retain admission forever.
 
+NFSv3 ACCESS calls delegate to `NFSFileSystem::access`, which returns the allowed
+permission bits and attributes from the same filesystem state. The default uses
+Unix owner/group/other mode bits, supplementary groups, and a privileged uid 0.
+Backends with ACLs, identity mapping, root squashing, or other restrictions must
+override it with the same authorization policy used by their file operations.
+Clients can use ACCESS to authorize opening data in their local cache, without
+sending a new READ request. A denied right is an unset result bit, while missing
+objects and storage failures return an error. Read-only exports retain read,
+directory lookup, and file execution permissions but cannot grant mutations.
+
 You simply need to implement the vfs::NFSFileSystem
 trait. See [examples/demo.rs](examples/demo.rs) for a filesystem implementation and TCP listener. The interface generally not difficult to implement; demanding mainly
 the ability to associate every file system object (directory/file) with a 64-bit
